@@ -7,8 +7,8 @@
 //! - GET  /v1/pipeline/status      — pipeline topology and connected peers
 //! - GET  /health                   — operator health check
 
-use blueprint_std::sync::Arc;
-use blueprint_std::time::Duration;
+use blueprint_sdk::std::sync::Arc;
+use blueprint_sdk::std::time::Duration;
 
 use axum::{
     extract::State,
@@ -217,8 +217,8 @@ async fn chat_completions(
         }
 
         // Validate expiry
-        let now = blueprint_std::time::SystemTime::now()
-            .duration_since(blueprint_std::time::UNIX_EPOCH)
+        let now = blueprint_sdk::std::time::SystemTime::now()
+            .duration_since(blueprint_sdk::std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
         if spend_auth.expiry < now.saturating_sub(state.config.billing.clock_skew_tolerance_secs) {
@@ -416,8 +416,8 @@ fn build_completion_response(
     let response = ChatCompletionResponse {
         id: format!("chatcmpl-{request_id}"),
         object: "chat.completion".to_string(),
-        created: blueprint_std::time::SystemTime::now()
-            .duration_since(blueprint_std::time::UNIX_EPOCH)
+        created: blueprint_sdk::std::time::SystemTime::now()
+            .duration_since(blueprint_sdk::std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs(),
         model: model.to_string(),

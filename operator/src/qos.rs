@@ -3,8 +3,8 @@
 //! Submits pipeline-specific metrics: layers served, tokens processed,
 //! pipeline latency, and peer connectivity status.
 
-use blueprint_std::sync::Arc;
-use blueprint_std::time::Duration;
+use blueprint_sdk::std::sync::Arc;
+use blueprint_sdk::std::time::Duration;
 
 use alloy::{
     network::EthereumWallet,

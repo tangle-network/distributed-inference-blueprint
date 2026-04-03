@@ -1,4 +1,4 @@
-use blueprint_std::sync::Arc;
+use blueprint_sdk::std::sync::Arc;
 
 use alloy_sol_types::SolValue;
 use blueprint_sdk::contexts::tangle::TangleClientContext;

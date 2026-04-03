@@ -4,7 +4,7 @@
 //! layer range. This module handles downloading the specific shard from
 //! HuggingFace and loading it into GPU memory via vLLM.
 
-use blueprint_std::path::{Path, PathBuf};
+use blueprint_sdk::std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 /// Configuration for which layers this operator serves.
@@ -104,8 +104,8 @@ pub async fn download_model_shard(
 
     // Identify shard files that contain parameters for our layer range.
     // Layer parameters are typically named: model.layers.{N}.{param}
-    let mut needed_files: blueprint_std::collections::HashSet<String> =
-        blueprint_std::collections::HashSet::new();
+    let mut needed_files: blueprint_sdk::std::collections::HashSet<String> =
+        blueprint_sdk::std::collections::HashSet::new();
 
     // Always need embedding and output head weights
     for (param_name, file_value) in weight_map {

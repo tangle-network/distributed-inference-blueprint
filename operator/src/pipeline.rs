@@ -7,7 +7,7 @@
 //! Topology example (Llama 405B, 4 operators):
 //!   Operator A (layers 0-25) -> B (26-50) -> C (51-75) -> D (76-100)
 
-use blueprint_std::sync::Arc;
+use blueprint_sdk::std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
 
@@ -94,7 +94,7 @@ impl PipelineManager {
         &self,
         input: ActivationPayload,
     ) -> anyhow::Result<ActivationPayload> {
-        let start = blueprint_std::time::Instant::now();
+        let start = blueprint_sdk::std::time::Instant::now();
 
         // Send activations to local vLLM shard for processing
         let client = reqwest::Client::new();
@@ -107,7 +107,7 @@ impl PipelineManager {
         let resp = client
             .post(format!("{}/process_layers", self.config.pipeline.vllm_endpoint))
             .json(&vllm_body)
-            .timeout(blueprint_std::time::Duration::from_millis(
+            .timeout(blueprint_sdk::std::time::Duration::from_millis(
                 self.config.network.activation_timeout_ms,
             ))
             .send()

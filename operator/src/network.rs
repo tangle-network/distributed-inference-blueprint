@@ -4,8 +4,8 @@
 //! intermediate activations between pipeline stages. Activations
 //! are serialized as raw f16 bytes for minimal overhead.
 
-use blueprint_std::sync::Arc;
-use blueprint_std::time::Duration;
+use blueprint_sdk::std::sync::Arc;
+use blueprint_sdk::std::time::Duration;
 use tokio::sync::RwLock;
 
 use crate::config::OperatorConfig;
