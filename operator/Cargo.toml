@@ -46,3 +46,7 @@ tokio-stream = { workspace = true }
 bytes = "1"
 uuid = { version = "1", features = ["v4"] }
 half = { version = "2", features = ["serde"] }
+
+[dev-dependencies]
+wiremock = "0.6"
+serde_json = { workspace = true }
