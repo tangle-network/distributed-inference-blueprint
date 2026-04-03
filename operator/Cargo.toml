@@ -1,0 +1,48 @@
+[package]
+name = "distributed-inference"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+name = "distributed_inference"
+path = "src/lib.rs"
+
+[[bin]]
+name = "distributed-inference-operator"
+path = "src/main.rs"
+
+[dependencies]
+blueprint-sdk = { workspace = true, features = ["tee", "networking"] }
+alloy = { workspace = true }
+alloy-sol-types = { workspace = true }
+tokio = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+reqwest = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+hex = { workspace = true }
+k256 = { workspace = true }
+
+# Web framework (OpenAI-compatible HTTP server)
+axum = { version = "0.7", features = ["json", "macros"] }
+tower-http = { version = "0.5", features = ["cors", "limit", "trace", "timeout"] }
+
+# Config
+config = "0.14"
+dotenvy = "0.15"
+
+# Metrics
+prometheus = { workspace = true }
+
+# Streaming
+futures-util = { workspace = true }
+tokio-stream = { workspace = true }
+
+# Misc
+bytes = "1"
+uuid = { version = "1", features = ["v4"] }
+half = { version = "2", features = ["serde"] }
