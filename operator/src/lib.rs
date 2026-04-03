@@ -96,6 +96,64 @@ fn register_pipeline_state(
     Ok(())
 }
 
+/// Shared state for direct testing (raw HTTP, no PipelineManager).
+static DIRECT_ENDPOINT: std::sync::OnceLock<DirectEndpoint> = std::sync::OnceLock::new();
+
+struct DirectEndpoint {
+    url: String,
+    client: reqwest::Client,
+    layer_start: u32,
+    layer_end: u32,
+}
+
+/// Initialize a raw HTTP endpoint for direct testing (wiremock).
+pub fn init_direct_for_testing(base_url: &str, layer_start: u32, layer_end: u32) {
+    let _ = DIRECT_ENDPOINT.set(DirectEndpoint {
+        url: format!("{base_url}/process_layers"),
+        client: reqwest::Client::new(),
+        layer_start,
+        layer_end,
+    });
+}
+
+/// Direct activation processing -- bypasses PipelineManager, does a raw HTTP POST.
+/// Returns the output activation data.
+pub async fn process_activations_direct(
+    input: &[f32],
+    layer_start: u32,
+    layer_end: u32,
+) -> Result<Vec<f32>, RunnerError> {
+    let endpoint = DIRECT_ENDPOINT.get().ok_or_else(|| {
+        RunnerError::Other("direct endpoint not registered".into())
+    })?;
+
+    let body = serde_json::json!({
+        "activations": input,
+        "layer_start": layer_start,
+        "layer_end": layer_end,
+    });
+
+    let resp = endpoint
+        .client
+        .post(&endpoint.url)
+        .json(&body)
+        .send()
+        .await
+        .map_err(|e| RunnerError::Other(format!("activation processing failed: {e}").into()))?;
+
+    let result: serde_json::Value = resp.json().await
+        .map_err(|e| RunnerError::Other(format!("activation response parse failed: {e}").into()))?;
+
+    let output = result["activations"]
+        .as_array()
+        .ok_or_else(|| RunnerError::Other("missing activations in response".into()))?
+        .iter()
+        .filter_map(|v| v.as_f64().map(|f| f as f32))
+        .collect::<Vec<f32>>();
+
+    Ok(output)
+}
+
 // --- Router ---
 
 pub fn router() -> Router {
