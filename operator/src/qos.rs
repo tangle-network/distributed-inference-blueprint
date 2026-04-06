@@ -1,7 +1,8 @@
 //! QoS heartbeat for distributed inference operators.
 //!
 //! Submits pipeline-specific metrics: layers served, tokens processed,
-//! pipeline latency, and peer connectivity status.
+//! pipeline latency, and peer connectivity status. Core's `on_chain_metrics`
+//! is merged in alongside the pipeline metrics.
 
 use blueprint_sdk::std::sync::Arc;
 use blueprint_sdk::std::time::Duration;
@@ -16,6 +17,19 @@ use alloy::{
 
 use crate::config::OperatorConfig;
 use crate::pipeline::PipelineManager;
+use tangle_inference_core::metrics;
+
+/// QoS configuration embedded in OperatorConfig.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct QoSConfig {
+    /// Heartbeat interval in seconds. 0 = disabled.
+    #[serde(default)]
+    pub heartbeat_interval_secs: u64,
+
+    /// On-chain address of the IOperatorStatusRegistry contract.
+    #[serde(default)]
+    pub status_registry_address: Option<String>,
+}
 
 sol! {
     #[sol(rpc)]
@@ -77,14 +91,19 @@ pub async fn start_heartbeat(
 
             let status = pipeline.status().await;
 
-            let metrics = vec![
+            let mut metric_pairs: Vec<IOperatorStatusRegistry::MetricPair> = metrics::on_chain_metrics()
+                .into_iter()
+                .map(|(key, value)| IOperatorStatusRegistry::MetricPair { key, value })
+                .collect();
+
+            metric_pairs.extend([
                 IOperatorStatusRegistry::MetricPair {
                     key: "layers_served".to_string(),
                     value: (layer_end - layer_start) as u64,
                 },
                 IOperatorStatusRegistry::MetricPair {
-                    key: "tokens_processed".to_string(),
-                    value: status.requests_processed, // approximation
+                    key: "pipeline_requests_processed".to_string(),
+                    value: status.requests_processed,
                 },
                 IOperatorStatusRegistry::MetricPair {
                     key: "pipeline_latency_ms".to_string(),
@@ -98,7 +117,7 @@ pub async fn start_heartbeat(
                     key: "downstream_connected".to_string(),
                     value: status.downstream_connected as u64,
                 },
-            ];
+            ]);
 
             match send_heartbeat(
                 &wallet,
@@ -106,14 +125,16 @@ pub async fn start_heartbeat(
                 registry_addr,
                 service_id,
                 blueprint_id,
-                metrics,
+                metric_pairs,
             )
             .await
             {
                 Ok(()) => {
+                    metrics::HEARTBEATS_SENT.inc();
                     tracing::debug!(service_id, blueprint_id, "heartbeat submitted");
                 }
                 Err(e) => {
+                    metrics::HEARTBEATS_FAILED.inc();
                     tracing::warn!(error = %e, "heartbeat submission failed");
                 }
             }

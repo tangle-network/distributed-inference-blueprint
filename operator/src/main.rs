@@ -8,8 +8,7 @@ use blueprint_sdk::runner::BlueprintRunner;
 use blueprint_sdk::tangle::{TangleConsumer, TangleProducer};
 
 use distributed_inference::config::OperatorConfig;
-use distributed_inference::health;
-use distributed_inference::DistributedInferenceServer;
+use distributed_inference::{detect_gpus, DistributedInferenceServer};
 
 fn setup_log() {
     use tracing_subscriber::{fmt, EnvFilter};
@@ -27,8 +26,8 @@ fn registration_payload(config: &OperatorConfig) -> Vec<u8> {
         config.pipeline.layer_start,
         config.pipeline.layer_end,
         config.pipeline.total_layers,
-        config.gpu.gpu_count,
-        config.gpu.total_vram_mib,
+        config.gpu.expected_gpu_count,
+        config.gpu.min_vram_mib,
         endpoint,
     )
         .abi_encode()
@@ -75,7 +74,7 @@ async fn main() -> Result<(), blueprint_sdk::Error> {
     }
 
     // GPU detection (non-fatal)
-    match health::detect_gpus().await {
+    match detect_gpus().await {
         Ok(gpus) => {
             tracing::info!(count = gpus.len(), "detected GPUs");
             for gpu in &gpus {

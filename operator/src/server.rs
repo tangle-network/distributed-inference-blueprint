@@ -1,48 +1,99 @@
 //! HTTP API server for the distributed inference operator.
 //!
-//! Routes:
-//! - POST /v1/chat/completions    — OpenAI-compatible (head only, with SpendAuth)
-//! - POST /v1/pipeline/activations — receive activations from upstream peer
-//! - POST /v1/pipeline/forward     — receive activations and return final output
-//! - GET  /v1/pipeline/status      — pipeline topology and connected peers
-//! - GET  /health                   — operator health check
+//! Routes exposed depend on the operator's pipeline position:
+//!
+//! **Head operator (`layer_start == 0`)** — full billing AppState:
+//! - `POST /v1/chat/completions` — OpenAI-compatible, x402 SpendAuth required
+//! - `POST /v1/pipeline/activations`, `POST /v1/pipeline/forward` — peer endpoints
+//! - `GET /v1/pipeline/status`, `/health`, `/metrics`
+//!
+//! **Intermediate / tail operators** — no billing, lightweight state:
+//! - `POST /v1/pipeline/activations`, `POST /v1/pipeline/forward`
+//! - `GET /v1/pipeline/status`, `/health`, `/metrics`
+//!
+//! Only the head validates x402 SpendAuth and calls BillingClient. Payment
+//! is split proportionally across the pipeline via on-chain settlement in the
+//! BSM contract — intermediate operators never touch customer billing state.
 
 use blueprint_sdk::std::sync::Arc;
 use blueprint_sdk::std::time::Duration;
 
 use axum::{
-    extract::State,
+    body::Body,
+    extract::{DefaultBodyLimit, State},
     http::{header, HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router as HttpRouter,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::Semaphore;
+use tokio::sync::OwnedSemaphorePermit;
+use tokio::task::JoinHandle;
 use tower_http::cors::CorsLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
+use tangle_inference_core::server::{
+    error_response, extract_x402_spend_auth, payment_required, settle_billing, validate_spend_auth,
+};
+use tangle_inference_core::{
+    AppState, CostModel, CostParams, PerTokenCostModel, RequestGuard, SpendAuthPayload,
+};
+
 use crate::config::OperatorConfig;
-use crate::health;
 use crate::network::PipelineNetwork;
 use crate::pipeline::{ActivationPayload, PipelineManager, RequestMetadata};
 
-// --- SpendAuth types (only enforced on head operator) ---
-
-#[derive(Debug, Deserialize)]
-pub struct SpendAuthPayload {
-    pub commitment: String,
-    pub service_id: u64,
-    pub job_index: u8,
-    pub amount: String,
-    pub operator: String,
-    pub nonce: u64,
-    pub expiry: u64,
-    pub signature: String,
+/// Backend attached to the head operator's `AppState` via `AppStateBuilder`.
+///
+/// Owns the pipeline coordinator, peer network handle, full operator config,
+/// and the per-token cost model. Retrieved in handlers via
+/// `state.backend::<DistributedBackend>().unwrap()`.
+pub struct DistributedBackend {
+    pub config: Arc<OperatorConfig>,
+    pub pipeline: Arc<PipelineManager>,
+    pub network: Arc<PipelineNetwork>,
+    pub cost_model: PerTokenCostModel,
 }
 
-// --- OpenAI-compatible request/response types ---
+impl DistributedBackend {
+    pub fn new(
+        config: Arc<OperatorConfig>,
+        pipeline: Arc<PipelineManager>,
+        network: Arc<PipelineNetwork>,
+    ) -> Self {
+        let cost_model = PerTokenCostModel {
+            price_per_input_token: config.pipeline.price_per_input_token,
+            price_per_output_token: config.pipeline.price_per_output_token,
+        };
+        Self {
+            config,
+            pipeline,
+            network,
+            cost_model,
+        }
+    }
+
+    /// Calculate the cost for a request given token counts.
+    pub fn calculate_cost(&self, prompt_tokens: u32, completion_tokens: u32) -> u64 {
+        self.cost_model.calculate_cost(&CostParams {
+            prompt_tokens,
+            completion_tokens,
+            ..Default::default()
+        })
+    }
+}
+
+/// Lightweight state for intermediate / tail operators. No billing, no nonce
+/// store — just the pipeline coordinator and network handle.
+#[derive(Clone)]
+pub struct PeerState {
+    pub config: Arc<OperatorConfig>,
+    pub pipeline: Arc<PipelineManager>,
+    pub network: Arc<PipelineNetwork>,
+}
+
+// --- Request / Response types (OpenAI-compatible) ---
 
 #[derive(Debug, Deserialize)]
 pub struct ChatCompletionRequest {
@@ -54,6 +105,9 @@ pub struct ChatCompletionRequest {
     pub temperature: f32,
     #[serde(default)]
     pub stream: bool,
+
+    /// ShieldedCredits spend authorization. Can also be provided via x402
+    /// headers (X-Payment-Signature).
     pub spend_auth: Option<SpendAuthPayload>,
 }
 
@@ -63,7 +117,7 @@ pub struct ChatMessage {
     pub content: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ChatCompletionResponse {
     pub id: String,
     pub object: String,
@@ -73,30 +127,18 @@ pub struct ChatCompletionResponse {
     pub usage: Usage,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Choice {
     pub index: u32,
     pub message: ChatMessage,
     pub finish_reason: String,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Usage {
     pub prompt_tokens: u32,
     pub completion_tokens: u32,
     pub total_tokens: u32,
-}
-
-#[derive(Debug, Serialize)]
-struct ErrorResponse {
-    error: ErrorDetail,
-}
-
-#[derive(Debug, Serialize)]
-struct ErrorDetail {
-    message: String,
-    r#type: String,
-    code: String,
 }
 
 fn default_max_tokens() -> u32 {
@@ -106,61 +148,76 @@ fn default_temperature() -> f32 {
     0.7
 }
 
-fn error_response(status: StatusCode, message: String, error_type: &str, code: &str) -> Response {
-    let body = ErrorResponse {
-        error: ErrorDetail {
-            message,
-            r#type: error_type.to_string(),
-            code: code.to_string(),
-        },
-    };
-    (status, Json(body)).into_response()
-}
+// --- Server startup ---
 
-/// Shared application state.
-#[derive(Clone)]
-pub struct AppState {
-    pub config: Arc<OperatorConfig>,
-    pub pipeline: Arc<PipelineManager>,
-    pub network: Arc<PipelineNetwork>,
-    pub semaphore: Arc<Semaphore>,
-}
-
-/// Start the HTTP server.
-pub async fn start(
+/// Start the head operator HTTP server (full billing AppState).
+pub async fn start_head(
     state: AppState,
-    mut shutdown_rx: tokio::sync::watch::Receiver<bool>,
-) -> anyhow::Result<tokio::task::JoinHandle<()>> {
-    let mut app = HttpRouter::new()
-        .route("/v1/pipeline/activations", post(receive_activations))
-        .route("/v1/pipeline/forward", post(forward_activations))
-        .route("/v1/pipeline/status", get(pipeline_status))
-        .route("/health", get(health_check));
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<JoinHandle<()>> {
+    let backend = state
+        .backend::<DistributedBackend>()
+        .ok_or_else(|| anyhow::anyhow!("AppState backend is not a DistributedBackend"))?;
+    let max_request_body_bytes = state.server_config.max_request_body_bytes;
+    let stream_timeout_secs = state.server_config.stream_timeout_secs;
+    let bind = format!("{}:{}", state.server_config.host, state.server_config.port);
+    let _ = backend;
 
-    // Only expose the chat completions endpoint on the pipeline head
-    if state.config.is_pipeline_head() {
-        app = app.route("/v1/chat/completions", post(chat_completions));
-    }
-
-    let app = app
-        .layer(TimeoutLayer::new(Duration::from_secs(
-            state.config.server.stream_timeout_secs,
-        )))
+    let app = HttpRouter::new()
+        .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/pipeline/activations", post(receive_activations_head))
+        .route("/v1/pipeline/forward", post(forward_activations_head))
+        .route("/v1/pipeline/status", get(pipeline_status_head))
+        .route("/health", get(health_check_head))
+        .route("/metrics", get(metrics_handler))
+        .layer(DefaultBodyLimit::max(max_request_body_bytes))
+        .layer(TimeoutLayer::new(Duration::from_secs(stream_timeout_secs)))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
-        .with_state(state.clone());
+        .with_state(state);
 
+    serve(app, bind, shutdown_rx_signal(shutdown_rx)).await
+}
+
+/// Start the intermediate/tail operator HTTP server (no billing).
+pub async fn start_peer(
+    state: PeerState,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<JoinHandle<()>> {
+    let max_request_body_bytes = state.config.server.max_request_body_bytes;
+    let stream_timeout_secs = state.config.server.stream_timeout_secs;
     let bind = format!("{}:{}", state.config.server.host, state.config.server.port);
+
+    let app = HttpRouter::new()
+        .route("/v1/pipeline/activations", post(receive_activations_peer))
+        .route("/v1/pipeline/forward", post(forward_activations_peer))
+        .route("/v1/pipeline/status", get(pipeline_status_peer))
+        .route("/health", get(health_check_peer))
+        .route("/metrics", get(metrics_handler))
+        .layer(DefaultBodyLimit::max(max_request_body_bytes))
+        .layer(TimeoutLayer::new(Duration::from_secs(stream_timeout_secs)))
+        .layer(CorsLayer::permissive())
+        .layer(TraceLayer::new_for_http())
+        .with_state(state);
+
+    serve(app, bind, shutdown_rx_signal(shutdown_rx)).await
+}
+
+async fn shutdown_rx_signal(mut rx: tokio::sync::watch::Receiver<bool>) {
+    let _ = rx.wait_for(|&v| v).await;
+}
+
+async fn serve(
+    app: HttpRouter,
+    bind: String,
+    shutdown: impl std::future::Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<JoinHandle<()>> {
     let listener = tokio::net::TcpListener::bind(&bind).await?;
     tracing::info!(bind = %bind, "HTTP server listening");
 
     let handle = tokio::spawn(async move {
-        let shutdown_signal = async move {
-            let _ = shutdown_rx.wait_for(|&v| v).await;
-            tracing::info!("HTTP server shutting down");
-        };
         if let Err(e) = axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown_signal)
+            .with_graceful_shutdown(shutdown)
             .await
         {
             tracing::error!(error = %e, "HTTP server error");
@@ -170,20 +227,30 @@ pub async fn start(
     Ok(handle)
 }
 
-// --- Handlers ---
+// --- Head handlers ---
 
-/// POST /v1/chat/completions — OpenAI-compatible endpoint (head operator only).
+fn backend_from(state: &AppState) -> &DistributedBackend {
+    state
+        .backend::<DistributedBackend>()
+        .expect("AppState backend is DistributedBackend (checked in start_head)")
+}
+
+/// POST /v1/chat/completions — head operator only.
 ///
-/// Accepts user requests, runs layers 0..layer_end through local vLLM,
-/// forwards activations through the pipeline, collects the final output
-/// from the tail operator, and returns it to the user.
+/// Validates x402 SpendAuth, authorizes the spend on-chain, runs the prompt
+/// through this operator's layers, forwards through the pipeline, and settles
+/// billing with the actual metered cost on return.
 async fn chat_completions(
     State(state): State<AppState>,
-    _headers: HeaderMap,
-    Json(req): Json<ChatCompletionRequest>,
+    headers: HeaderMap,
+    Json(mut req): Json<ChatCompletionRequest>,
 ) -> Response {
-    // Semaphore
-    let _permit = match state.semaphore.clone().try_acquire_owned() {
+    let backend = backend_from(&state);
+    let model_name = req.model.as_deref().unwrap_or(&backend.config.pipeline.model_id);
+    let mut metrics_guard = RequestGuard::new(model_name);
+
+    // 1. Acquire semaphore permit
+    let _permit: OwnedSemaphorePermit = match state.semaphore.clone().try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
             return error_response(
@@ -195,43 +262,50 @@ async fn chat_completions(
         }
     };
 
-    // SpendAuth validation (head operator only)
-    if state.config.billing.billing_required && req.spend_auth.is_none() {
-        return error_response(
-            StatusCode::PAYMENT_REQUIRED,
-            "SpendAuth required for inference".to_string(),
-            "billing_error",
-            "payment_required",
+    // 2. x402 header fallback
+    if req.spend_auth.is_none() {
+        if let Some(x402_auth) = extract_x402_spend_auth(&headers) {
+            req.spend_auth = Some(x402_auth);
+        }
+    }
+
+    // 3. Enforce billing requirement — 402 Payment Required if missing
+    if state.billing_config.billing_required && req.spend_auth.is_none() {
+        let estimated = backend.calculate_cost(1000, 512);
+        return payment_required(
+            &state.billing_config,
+            &state.tangle_config,
+            state.operator_address,
+            estimated,
         );
     }
 
-    if let Some(ref spend_auth) = req.spend_auth {
-        // Validate amount
-        if spend_auth.amount.parse::<u64>().is_err() {
-            return error_response(
-                StatusCode::BAD_REQUEST,
-                "invalid spend_auth amount".to_string(),
-                "billing_error",
-                "invalid_amount",
-            );
+    // 4. Validate SpendAuth (signature, account, nonce replay)
+    let preauth_amount: Option<u64> = if let Some(ref spend_auth) = req.spend_auth {
+        match validate_spend_auth(&state, spend_auth).await {
+            Ok(amt) => Some(amt),
+            Err(resp) => return resp,
         }
+    } else {
+        None
+    };
 
-        // Validate expiry
-        let now = blueprint_sdk::std::time::SystemTime::now()
-            .duration_since(blueprint_sdk::std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs();
-        if spend_auth.expiry < now.saturating_sub(state.config.billing.clock_skew_tolerance_secs) {
+    // 5. Pre-authorize on-chain (head only — head collects; BSM contract
+    //    settles proportional shares to intermediate/tail via on-chain split)
+    //    Nonce is recorded inside validate_spend_auth — no separate insert needed.
+    if let Some(ref spend_auth) = req.spend_auth {
+        if let Err(e) = state.billing.authorize_spend(spend_auth).await {
+            tracing::error!(error = %e, "authorizeSpend failed");
             return error_response(
-                StatusCode::BAD_REQUEST,
-                "spend_auth expired".to_string(),
+                StatusCode::PAYMENT_REQUIRED,
+                format!("billing authorization failed: {e}"),
                 "billing_error",
-                "expired",
+                "authorization_failed",
             );
         }
     }
 
-    // Build initial activation from the user's prompt
+    // 6. Build initial activation from the prompt
     let request_id = uuid::Uuid::new_v4().to_string();
     let prompt = req
         .messages
@@ -242,7 +316,7 @@ async fn chat_completions(
 
     let initial_activation = ActivationPayload {
         request_id: request_id.clone(),
-        shape: vec![1, prompt.len() as u64, 1], // placeholder shape
+        shape: vec![1, prompt.len() as u64, 1],
         data: prompt.as_bytes().to_vec(),
         metadata: RequestMetadata {
             prompt: prompt.clone(),
@@ -252,9 +326,9 @@ async fn chat_completions(
         },
     };
 
-    // Process through local layers
-    let local_output = match state.pipeline.process_activations(initial_activation).await {
-        Ok(output) => output,
+    // 7. Process through local layers
+    let local_output = match backend.pipeline.process_activations(initial_activation).await {
+        Ok(o) => o,
         Err(e) => {
             tracing::error!(error = %e, "local layer processing failed");
             return error_response(
@@ -266,41 +340,114 @@ async fn chat_completions(
         }
     };
 
-    // If this is also the tail (single-operator pipeline), return directly
-    if state.config.is_pipeline_tail() {
-        return build_completion_response(
-            &request_id,
-            &state.config.pipeline.model_id,
-            &local_output,
-        );
-    }
-
-    // Forward through the pipeline and wait for the final result
-    let final_output = match state.network.send_activations_and_wait(local_output).await {
-        Ok(output) => output,
-        Err(e) => {
-            tracing::error!(error = %e, "pipeline forwarding failed");
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("pipeline forwarding failed: {e}"),
-                "pipeline_error",
-                "forwarding_failed",
-            );
+    // 8. Forward through remaining pipeline stages (if any)
+    let final_output = if backend.config.is_pipeline_tail() {
+        local_output
+    } else {
+        match backend.network.send_activations_and_wait(local_output).await {
+            Ok(o) => o,
+            Err(e) => {
+                tracing::error!(error = %e, "pipeline forwarding failed");
+                return error_response(
+                    StatusCode::BAD_GATEWAY,
+                    format!("pipeline forwarding failed: {e}"),
+                    "pipeline_error",
+                    "forwarding_failed",
+                );
+            }
         }
     };
 
-    build_completion_response(&request_id, &state.config.pipeline.model_id, &final_output)
+    // 9. Build OpenAI-compatible response
+    let response = build_completion_response(
+        &request_id,
+        &backend.config.pipeline.model_id,
+        &final_output,
+    );
+
+    // 10. Record metrics + settle billing (contract splits across layers)
+    let prompt_tokens = response.usage.prompt_tokens;
+    let completion_tokens = response.usage.completion_tokens;
+    metrics_guard.set_tokens(prompt_tokens, completion_tokens);
+    metrics_guard.set_success();
+
+    if let (Some(ref spend_auth), Some(preauth)) = (&req.spend_auth, preauth_amount) {
+        let actual_cost = backend.calculate_cost(prompt_tokens, completion_tokens);
+        if let Err(e) = settle_billing(&state.billing, spend_auth, preauth, actual_cost).await {
+            tracing::error!(error = %e, "on-chain settlement failed — manual recovery required");
+        }
+    }
+
+    Json(response).into_response()
 }
 
-/// POST /v1/pipeline/activations — receive activations from upstream peer.
-/// Fire-and-forget: processes locally and forwards downstream.
-async fn receive_activations(
+async fn receive_activations_head(
     State(state): State<AppState>,
     Json(payload): Json<ActivationPayload>,
 ) -> Response {
-    state.network.mark_upstream_connected().await;
+    let backend = backend_from(&state);
+    run_receive_activations(&backend.pipeline, &backend.network, &backend.config, payload).await
+}
 
-    let output = match state.pipeline.process_activations(payload).await {
+async fn forward_activations_head(
+    State(state): State<AppState>,
+    Json(payload): Json<ActivationPayload>,
+) -> Response {
+    let backend = backend_from(&state);
+    run_forward_activations(&backend.pipeline, &backend.network, &backend.config, payload).await
+}
+
+async fn pipeline_status_head(State(state): State<AppState>) -> Json<serde_json::Value> {
+    let backend = backend_from(&state);
+    let status = backend.pipeline.status().await;
+    Json(serde_json::to_value(status).unwrap_or_default())
+}
+
+async fn health_check_head(State(state): State<AppState>) -> Response {
+    let backend = backend_from(&state);
+    run_health_check(&backend.network, &backend.config).await
+}
+
+// --- Peer handlers (intermediate / tail — no billing) ---
+
+async fn receive_activations_peer(
+    State(state): State<PeerState>,
+    Json(payload): Json<ActivationPayload>,
+) -> Response {
+    run_receive_activations(&state.pipeline, &state.network, &state.config, payload).await
+}
+
+async fn forward_activations_peer(
+    State(state): State<PeerState>,
+    Json(payload): Json<ActivationPayload>,
+) -> Response {
+    run_forward_activations(&state.pipeline, &state.network, &state.config, payload).await
+}
+
+async fn pipeline_status_peer(State(state): State<PeerState>) -> Json<serde_json::Value> {
+    let status = state.pipeline.status().await;
+    Json(serde_json::to_value(status).unwrap_or_default())
+}
+
+async fn health_check_peer(State(state): State<PeerState>) -> Response {
+    run_health_check(&state.network, &state.config).await
+}
+
+// --- Shared handler bodies ---
+
+async fn run_receive_activations(
+    pipeline: &Arc<PipelineManager>,
+    network: &Arc<PipelineNetwork>,
+    config: &Arc<OperatorConfig>,
+    payload: ActivationPayload,
+) -> Response {
+    network.mark_upstream_connected().await;
+
+    // RequestGuard records metrics for this pipeline hop (tail = the request
+    // that actually produced tokens; intermediate = forward hop cost).
+    let mut guard = RequestGuard::new(&config.pipeline.model_id);
+
+    let output = match pipeline.process_activations(payload).await {
         Ok(o) => o,
         Err(e) => {
             tracing::error!(error = %e, "activation processing failed");
@@ -313,33 +460,33 @@ async fn receive_activations(
         }
     };
 
-    if state.config.is_pipeline_tail() {
-        // Return the final output as the response
+    if config.is_pipeline_tail() {
+        guard.set_success();
         Json(output).into_response()
+    } else if let Err(e) = pipeline.forward_downstream(output).await {
+        tracing::error!(error = %e, "downstream forwarding failed");
+        error_response(
+            StatusCode::BAD_GATEWAY,
+            format!("downstream forwarding failed: {e}"),
+            "pipeline_error",
+            "forwarding_failed",
+        )
     } else {
-        // Forward downstream
-        if let Err(e) = state.pipeline.forward_downstream(output).await {
-            tracing::error!(error = %e, "downstream forwarding failed");
-            return error_response(
-                StatusCode::BAD_GATEWAY,
-                format!("downstream forwarding failed: {e}"),
-                "pipeline_error",
-                "forwarding_failed",
-            );
-        }
+        guard.set_success();
         StatusCode::OK.into_response()
     }
 }
 
-/// POST /v1/pipeline/forward — receive activations and return final output.
-/// Blocking: waits for the entire downstream pipeline to complete.
-async fn forward_activations(
-    State(state): State<AppState>,
-    Json(payload): Json<ActivationPayload>,
+async fn run_forward_activations(
+    pipeline: &Arc<PipelineManager>,
+    network: &Arc<PipelineNetwork>,
+    config: &Arc<OperatorConfig>,
+    payload: ActivationPayload,
 ) -> Response {
-    state.network.mark_upstream_connected().await;
+    network.mark_upstream_connected().await;
+    let mut guard = RequestGuard::new(&config.pipeline.model_id);
 
-    let output = match state.pipeline.process_activations(payload).await {
+    let output = match pipeline.process_activations(payload).await {
         Ok(o) => o,
         Err(e) => {
             tracing::error!(error = %e, "activation processing failed");
@@ -352,11 +499,15 @@ async fn forward_activations(
         }
     };
 
-    if state.config.is_pipeline_tail() {
+    if config.is_pipeline_tail() {
+        guard.set_success();
         Json(output).into_response()
     } else {
-        match state.network.send_activations_and_wait(output).await {
-            Ok(final_output) => Json(final_output).into_response(),
+        match network.send_activations_and_wait(output).await {
+            Ok(final_output) => {
+                guard.set_success();
+                Json(final_output).into_response()
+            }
             Err(e) => {
                 tracing::error!(error = %e, "downstream chain failed");
                 error_response(
@@ -370,27 +521,21 @@ async fn forward_activations(
     }
 }
 
-/// GET /v1/pipeline/status — show pipeline topology and peer connectivity.
-async fn pipeline_status(State(state): State<AppState>) -> Json<serde_json::Value> {
-    let status = state.pipeline.status().await;
-    Json(serde_json::to_value(status).unwrap_or_default())
-}
-
-/// GET /health
-async fn health_check(State(state): State<AppState>) -> Response {
-    let downstream_ok = state.network.check_downstream_health().await;
-    let is_tail = state.config.is_pipeline_tail();
-
-    // Head/middle operators need downstream connectivity; tail just needs vLLM
+async fn run_health_check(
+    network: &Arc<PipelineNetwork>,
+    config: &Arc<OperatorConfig>,
+) -> Response {
+    let downstream_ok = network.check_downstream_health().await;
+    let is_tail = config.is_pipeline_tail();
     let healthy = is_tail || downstream_ok;
 
     if healthy {
         Json(serde_json::json!({
             "status": "ok",
-            "model": state.config.pipeline.model_id,
-            "layers": format!("{}-{}", state.config.pipeline.layer_start, state.config.pipeline.layer_end),
-            "pipeline_head": state.config.is_pipeline_head(),
-            "pipeline_tail": state.config.is_pipeline_tail(),
+            "model": config.pipeline.model_id,
+            "layers": format!("{}-{}", config.pipeline.layer_start, config.pipeline.layer_end),
+            "pipeline_head": config.is_pipeline_head(),
+            "pipeline_tail": config.is_pipeline_tail(),
             "downstream_connected": downstream_ok,
         }))
         .into_response()
@@ -404,16 +549,34 @@ async fn health_check(State(state): State<AppState>) -> Response {
     }
 }
 
+async fn metrics_handler() -> Response {
+    let body = tangle_inference_core::metrics::gather();
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(
+            header::CONTENT_TYPE,
+            "text/plain; version=0.0.4; charset=utf-8",
+        )
+        .body(Body::from(body))
+        .unwrap_or_else(|e| {
+            error_response(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to build metrics response: {e}"),
+                "internal_error",
+                "response_build_failed",
+            )
+        })
+}
+
 /// Build an OpenAI-compatible chat completion response from the final pipeline output.
 fn build_completion_response(
     request_id: &str,
     model: &str,
     output: &ActivationPayload,
-) -> Response {
-    // The final activation data contains the generated text
+) -> ChatCompletionResponse {
     let text = String::from_utf8_lossy(&output.data).to_string();
 
-    let response = ChatCompletionResponse {
+    ChatCompletionResponse {
         id: format!("chatcmpl-{request_id}"),
         object: "chat.completion".to_string(),
         created: blueprint_sdk::std::time::SystemTime::now()
@@ -430,11 +593,9 @@ fn build_completion_response(
             finish_reason: "stop".to_string(),
         }],
         usage: Usage {
-            prompt_tokens: 0, // populated by vLLM layer output
+            prompt_tokens: 0,
             completion_tokens: 0,
             total_tokens: 0,
         },
-    };
-
-    Json(response).into_response()
+    }
 }

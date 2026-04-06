@@ -27,6 +27,9 @@ thiserror = { workspace = true }
 hex = { workspace = true }
 k256 = { workspace = true }
 
+# Shared inference operator infrastructure (billing, metrics, health, server helpers)
+tangle-inference-core = { git = "https://github.com/tangle-network/tangle-inference-core", branch = "master" }
+
 # Web framework (OpenAI-compatible HTTP server)
 axum = { version = "0.7", features = ["json", "macros"] }
 tower-http = { version = "0.5", features = ["cors", "limit", "trace", "timeout"] }
@@ -52,3 +55,5 @@ wiremock = "0.6"
 serde_json = { workspace = true }
 tokio = { workspace = true }
 anyhow = { workspace = true }
+tower = { version = "0.5", features = ["util"] }
+alloy-primitives = "1"

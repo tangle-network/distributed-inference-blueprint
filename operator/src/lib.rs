@@ -1,10 +1,20 @@
 pub mod config;
-pub mod health;
 pub mod network;
 pub mod pipeline;
 pub mod qos;
 pub mod server;
 pub mod shard;
+
+// Re-export shared infrastructure for downstream callers / tests.
+pub use tangle_inference_core::{
+    detect_gpus, parse_nvidia_smi_output, AppState, AppStateBuilder, BillingClient, CostModel,
+    CostParams, GpuInfo, NonceStore, PerTokenCostModel, RequestGuard, SpendAuthPayload,
+};
+pub use tangle_inference_core::server::{
+    error_response, extract_x402_spend_auth, payment_required, settle_billing, validate_spend_auth,
+};
+pub use tangle_inference_core::metrics;
+pub use tangle_inference_core::billing;
 
 use blueprint_sdk::std::sync::Arc;
 use blueprint_sdk::std::time::Duration;
@@ -22,6 +32,7 @@ use tokio::sync::oneshot;
 use crate::config::OperatorConfig;
 use crate::network::PipelineNetwork;
 use crate::pipeline::PipelineManager;
+use crate::server::DistributedBackend;
 
 // --- ABI types for on-chain job encoding ---
 
@@ -70,29 +81,21 @@ pub const INFERENCE_JOB: u8 = 0;
 pub const JOIN_PIPELINE_JOB: u8 = 1;
 pub const LEAVE_PIPELINE_JOB: u8 = 2;
 
-// --- Shared state ---
+// --- Shared state for the on-chain job handler ---
 
 static PIPELINE_STATE: std::sync::OnceLock<PipelineState> = std::sync::OnceLock::new();
 
 struct PipelineState {
     pipeline: Arc<PipelineManager>,
     config: Arc<OperatorConfig>,
-    client: reqwest::Client,
 }
 
+#[allow(clippy::result_large_err)]
 fn register_pipeline_state(
     config: Arc<OperatorConfig>,
     pipeline: Arc<PipelineManager>,
 ) -> Result<(), RunnerError> {
-    let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(300))
-        .build()
-        .map_err(|e| RunnerError::Other(format!("failed to build HTTP client: {e}").into()))?;
-    let _ = PIPELINE_STATE.set(PipelineState {
-        pipeline,
-        config,
-        client,
-    });
+    let _ = PIPELINE_STATE.set(PipelineState { pipeline, config });
     Ok(())
 }
 
@@ -116,16 +119,19 @@ pub fn init_direct_for_testing(base_url: &str, layer_start: u32, layer_end: u32)
     });
 }
 
-/// Direct activation processing -- bypasses PipelineManager, does a raw HTTP POST.
-/// Returns the output activation data.
+/// Direct activation processing — bypasses PipelineManager with a raw HTTP POST.
 pub async fn process_activations_direct(
     input: &[f32],
     layer_start: u32,
     layer_end: u32,
 ) -> Result<Vec<f32>, RunnerError> {
-    let endpoint = DIRECT_ENDPOINT.get().ok_or_else(|| {
-        RunnerError::Other("direct endpoint not registered".into())
-    })?;
+    let endpoint = DIRECT_ENDPOINT
+        .get()
+        .ok_or_else(|| RunnerError::Other("direct endpoint not registered".into()))?;
+
+    // layer_start/layer_end captured at registration time; caller passes
+    // the same values for compatibility with earlier test harnesses.
+    let _ = (endpoint.layer_start, endpoint.layer_end);
 
     let body = serde_json::json!({
         "activations": input,
@@ -141,7 +147,9 @@ pub async fn process_activations_direct(
         .await
         .map_err(|e| RunnerError::Other(format!("activation processing failed: {e}").into()))?;
 
-    let result: serde_json::Value = resp.json().await
+    let result: serde_json::Value = resp
+        .json()
+        .await
         .map_err(|e| RunnerError::Other(format!("activation response parse failed: {e}").into()))?;
 
     let output = result["activations"]
@@ -184,19 +192,17 @@ pub fn router() -> Router {
 pub async fn run_inference(
     TangleArg(request): TangleArg<InferenceRequest>,
 ) -> Result<TangleResult<InferenceResult>, RunnerError> {
-    let state = PIPELINE_STATE.get().ok_or_else(|| {
-        RunnerError::Other("pipeline state not registered".into())
-    })?;
+    let state = PIPELINE_STATE
+        .get()
+        .ok_or_else(|| RunnerError::Other("pipeline state not registered".into()))?;
 
-    let temperature = request.temperature as f32 / 1000.0;
-
-    // For on-chain jobs, the head operator receives the request and
-    // orchestrates the full pipeline pass.
     if !state.config.is_pipeline_head() {
         return Err(RunnerError::Other(
             "inference jobs must be submitted to the pipeline head operator".into(),
         ));
     }
+
+    let temperature = request.temperature as f32 / 1000.0;
 
     let activation = pipeline::ActivationPayload {
         request_id: uuid::Uuid::new_v4().to_string(),
@@ -210,14 +216,12 @@ pub async fn run_inference(
         },
     };
 
-    // Process through local layers
     let local_output = state
         .pipeline
         .process_activations(activation)
         .await
         .map_err(|e| RunnerError::Other(format!("layer processing failed: {e}").into()))?;
 
-    // If multi-operator pipeline, forward through remaining stages
     let final_output = if state.config.is_pipeline_tail() {
         local_output
     } else {
@@ -226,7 +230,6 @@ pub async fn run_inference(
             .forward_downstream(local_output.clone())
             .await
             .map_err(|e| RunnerError::Other(format!("pipeline forward failed: {e}").into()))?;
-        // For on-chain jobs we use the synchronous forward path
         local_output
     };
 
@@ -243,9 +246,9 @@ pub async fn run_inference(
 pub async fn join_pipeline(
     TangleArg(request): TangleArg<JoinPipelineRequest>,
 ) -> Result<TangleResult<JoinPipelineResult>, RunnerError> {
-    let state = PIPELINE_STATE.get().ok_or_else(|| {
-        RunnerError::Other("pipeline state not registered".into())
-    })?;
+    let state = PIPELINE_STATE
+        .get()
+        .ok_or_else(|| RunnerError::Other("pipeline state not registered".into()))?;
 
     tracing::info!(
         pipeline_id = request.pipelineId,
@@ -269,17 +272,15 @@ pub async fn join_pipeline(
 pub async fn leave_pipeline(
     TangleArg(request): TangleArg<LeavePipelineRequest>,
 ) -> Result<TangleResult<LeavePipelineResult>, RunnerError> {
-    tracing::info!(
-        pipeline_id = request.pipelineId,
-        "leave pipeline request"
-    );
-
+    tracing::info!(pipeline_id = request.pipelineId, "leave pipeline request");
     Ok(TangleResult(LeavePipelineResult { success: true }))
 }
 
-// --- Background service ---
+// --- Background service: HTTP server + pipeline coordinator ---
 
-/// Runs the HTTP server and manages the pipeline lifecycle.
+/// Runs the HTTP server and manages the pipeline lifecycle. On the head
+/// operator this includes the billing-aware `AppState`; on intermediate and
+/// tail operators a lightweight `PeerState` is used instead.
 #[derive(Clone)]
 pub struct DistributedInferenceServer {
     pub config: Arc<OperatorConfig>,
@@ -291,43 +292,47 @@ impl BackgroundService for DistributedInferenceServer {
         let config = self.config.clone();
 
         tokio::spawn(async move {
-            // 1. Build the pipeline network
+            // 1. Build the peer network + pipeline manager
             let network = Arc::new(PipelineNetwork::new(config.clone()));
-
-            // 2. Build the pipeline manager
             let pipeline = Arc::new(PipelineManager::new(config.clone(), network.clone()));
 
-            // 3. Register shared state for on-chain job handlers
+            // 2. Register shared state for on-chain job handlers
             if let Err(e) = register_pipeline_state(config.clone(), pipeline.clone()) {
-                tracing::error!(error = %e, "failed to register pipeline state");
                 let _ = tx.send(Err(e));
                 return;
             }
 
-            // 4. Build semaphore
-            let max_concurrent = config.server.max_concurrent_requests;
-            let semaphore = Arc::new(if max_concurrent == 0 {
-                tokio::sync::Semaphore::new(tokio::sync::Semaphore::MAX_PERMITS)
-            } else {
-                tokio::sync::Semaphore::new(max_concurrent)
-            });
-
-            // 5. Shutdown channel
+            // 3. Shutdown channel
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
-            // 6. Start HTTP server
-            let state = server::AppState {
-                config: config.clone(),
-                pipeline: pipeline.clone(),
-                network: network.clone(),
-                semaphore,
-            };
+            // 4. Start the HTTP server — head gets full billing AppState,
+            //    intermediate/tail use the lightweight PeerState.
+            let start_result: anyhow::Result<tokio::task::JoinHandle<()>> =
+                if config.is_pipeline_head() {
+                    build_head_state_and_start(
+                        config.clone(),
+                        pipeline.clone(),
+                        network.clone(),
+                        shutdown_rx.clone(),
+                    )
+                    .await
+                } else {
+                    let state = server::PeerState {
+                        config: config.clone(),
+                        pipeline: pipeline.clone(),
+                        network: network.clone(),
+                    };
+                    server::start_peer(state, shutdown_rx.clone()).await
+                };
 
-            match server::start(state, shutdown_rx).await {
+            match start_result {
                 Ok(_handle) => {
                     tracing::info!(
                         model = %config.pipeline.model_id,
-                        layers = format!("{}-{}", config.pipeline.layer_start, config.pipeline.layer_end),
+                        layers = format!(
+                            "{}-{}",
+                            config.pipeline.layer_start, config.pipeline.layer_end
+                        ),
                         head = config.is_pipeline_head(),
                         tail = config.is_pipeline_tail(),
                         "distributed inference server started"
@@ -341,7 +346,7 @@ impl BackgroundService for DistributedInferenceServer {
                 }
             }
 
-            // 7. Connectivity watchdog
+            // 5. Connectivity watchdog
             loop {
                 tokio::select! {
                     _ = tokio::time::sleep(Duration::from_secs(15)) => {}
@@ -352,7 +357,6 @@ impl BackgroundService for DistributedInferenceServer {
                     }
                 }
 
-                // Check peer connectivity
                 let downstream_ok = network.check_downstream_health().await;
                 let upstream_ok = network.check_upstream_health().await;
 
@@ -367,4 +371,29 @@ impl BackgroundService for DistributedInferenceServer {
 
         Ok(rx)
     }
+}
+
+/// Build the head operator's billing-aware `AppState` and start the HTTP server.
+async fn build_head_state_and_start(
+    config: Arc<OperatorConfig>,
+    pipeline: Arc<PipelineManager>,
+    network: Arc<PipelineNetwork>,
+    shutdown_rx: tokio::sync::watch::Receiver<bool>,
+) -> anyhow::Result<tokio::task::JoinHandle<()>> {
+    let billing_client = Arc::new(BillingClient::new(&config.tangle, &config.billing)?);
+    let operator_address = billing_client.operator_address();
+    let nonce_store = Arc::new(NonceStore::load(config.billing.nonce_store_path.clone()));
+    let backend = DistributedBackend::new(config.clone(), pipeline, network);
+
+    let state = AppStateBuilder::new()
+        .billing(billing_client)
+        .nonce_store(nonce_store)
+        .server_config(Arc::new(config.server.clone()))
+        .billing_config(Arc::new(config.billing.clone()))
+        .tangle_config(Arc::new(config.tangle.clone()))
+        .operator_address(operator_address)
+        .backend(backend)
+        .build()?;
+
+    server::start_head(state, shutdown_rx).await
 }

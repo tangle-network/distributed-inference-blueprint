@@ -187,7 +187,6 @@ mod serde_bytes_base64 {
     use serde::{Deserialize, Deserializer, Serializer};
 
     pub fn serialize<S: Serializer>(data: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-        use serde::ser::Error;
         let encoded = hex::encode(data);
         serializer.serialize_str(&encoded)
     }
