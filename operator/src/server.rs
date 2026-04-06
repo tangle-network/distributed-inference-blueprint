@@ -19,22 +19,20 @@ use blueprint_sdk::std::sync::Arc;
 use blueprint_sdk::std::time::Duration;
 
 use axum::{
-    body::Body,
     extract::{DefaultBodyLimit, State},
-    http::{header, HeaderMap, StatusCode},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
     routing::{get, post},
     Json, Router as HttpRouter,
 };
 use serde::{Deserialize, Serialize};
-use tokio::sync::OwnedSemaphorePermit;
 use tokio::task::JoinHandle;
 use tower_http::cors::CorsLayer;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 
 use tangle_inference_core::server::{
-    error_response, extract_x402_spend_auth, payment_required, settle_billing, validate_spend_auth,
+    acquire_permit, billing_gate, error_response, metrics_handler, settle_billing,
 };
 use tangle_inference_core::{
     AppState, CostModel, CostParams, PerTokenCostModel, RequestGuard, SpendAuthPayload,
@@ -243,69 +241,27 @@ fn backend_from(state: &AppState) -> &DistributedBackend {
 async fn chat_completions(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Json(mut req): Json<ChatCompletionRequest>,
+    Json(req): Json<ChatCompletionRequest>,
 ) -> Response {
     let backend = backend_from(&state);
     let model_name = req.model.as_deref().unwrap_or(&backend.config.pipeline.model_id);
     let mut metrics_guard = RequestGuard::new(model_name);
 
-    // 1. Acquire semaphore permit
-    let _permit: OwnedSemaphorePermit = match state.semaphore.clone().try_acquire_owned() {
+    // 1. Concurrency gate
+    let _permit = match acquire_permit(&state) {
         Ok(p) => p,
-        Err(_) => {
-            return error_response(
-                StatusCode::TOO_MANY_REQUESTS,
-                "server at capacity".to_string(),
-                "rate_limit_error",
-                "too_many_requests",
-            );
-        }
+        Err(resp) => return resp,
     };
 
-    // 2. x402 header fallback
-    if req.spend_auth.is_none() {
-        if let Some(x402_auth) = extract_x402_spend_auth(&headers) {
-            req.spend_auth = Some(x402_auth);
-        }
-    }
-
-    // 3. Enforce billing requirement — 402 Payment Required if missing
-    if state.billing_config.billing_required && req.spend_auth.is_none() {
-        let estimated = backend.calculate_cost(1000, 512);
-        return payment_required(
-            &state.billing_config,
-            &state.tangle_config,
-            state.operator_address,
-            estimated,
-        );
-    }
-
-    // 4. Validate SpendAuth (signature, account, nonce replay)
-    let preauth_amount: Option<u64> = if let Some(ref spend_auth) = req.spend_auth {
-        match validate_spend_auth(&state, spend_auth).await {
-            Ok(amt) => Some(amt),
+    // 2. Billing gate — extract + validate + authorize in one call
+    let estimated = backend.calculate_cost(1000, 512);
+    let (spend_auth, preauth_amount) =
+        match billing_gate(&state, &headers, req.spend_auth, estimated).await {
+            Ok(pair) => pair,
             Err(resp) => return resp,
-        }
-    } else {
-        None
-    };
+        };
 
-    // 5. Pre-authorize on-chain (head only — head collects; BSM contract
-    //    settles proportional shares to intermediate/tail via on-chain split)
-    //    Nonce is recorded inside validate_spend_auth — no separate insert needed.
-    if let Some(ref spend_auth) = req.spend_auth {
-        if let Err(e) = state.billing.authorize_spend(spend_auth).await {
-            tracing::error!(error = %e, "authorizeSpend failed");
-            return error_response(
-                StatusCode::PAYMENT_REQUIRED,
-                format!("billing authorization failed: {e}"),
-                "billing_error",
-                "authorization_failed",
-            );
-        }
-    }
-
-    // 6. Build initial activation from the prompt
+    // 3. Build initial activation from the prompt
     let request_id = uuid::Uuid::new_v4().to_string();
     let prompt = req
         .messages
@@ -326,7 +282,7 @@ async fn chat_completions(
         },
     };
 
-    // 7. Process through local layers
+    // 4. Process through local layers
     let local_output = match backend.pipeline.process_activations(initial_activation).await {
         Ok(o) => o,
         Err(e) => {
@@ -340,7 +296,7 @@ async fn chat_completions(
         }
     };
 
-    // 8. Forward through remaining pipeline stages (if any)
+    // 5. Forward through remaining pipeline stages (if any)
     let final_output = if backend.config.is_pipeline_tail() {
         local_output
     } else {
@@ -358,22 +314,22 @@ async fn chat_completions(
         }
     };
 
-    // 9. Build OpenAI-compatible response
+    // 6. Build OpenAI-compatible response
     let response = build_completion_response(
         &request_id,
         &backend.config.pipeline.model_id,
         &final_output,
     );
 
-    // 10. Record metrics + settle billing (contract splits across layers)
+    // 7. Record metrics + settle billing
     let prompt_tokens = response.usage.prompt_tokens;
     let completion_tokens = response.usage.completion_tokens;
     metrics_guard.set_tokens(prompt_tokens, completion_tokens);
     metrics_guard.set_success();
 
-    if let (Some(ref spend_auth), Some(preauth)) = (&req.spend_auth, preauth_amount) {
+    if let (Some(ref sa), Some(preauth)) = (&spend_auth, preauth_amount) {
         let actual_cost = backend.calculate_cost(prompt_tokens, completion_tokens);
-        if let Err(e) = settle_billing(&state.billing, spend_auth, preauth, actual_cost).await {
+        if let Err(e) = settle_billing(&state.billing, sa, preauth, actual_cost).await {
             tracing::error!(error = %e, "on-chain settlement failed — manual recovery required");
         }
     }
@@ -443,8 +399,6 @@ async fn run_receive_activations(
 ) -> Response {
     network.mark_upstream_connected().await;
 
-    // RequestGuard records metrics for this pipeline hop (tail = the request
-    // that actually produced tokens; intermediate = forward hop cost).
     let mut guard = RequestGuard::new(&config.pipeline.model_id);
 
     let output = match pipeline.process_activations(payload).await {
@@ -547,25 +501,6 @@ async fn run_health_check(
             "downstream_disconnected",
         )
     }
-}
-
-async fn metrics_handler() -> Response {
-    let body = tangle_inference_core::metrics::gather();
-    Response::builder()
-        .status(StatusCode::OK)
-        .header(
-            header::CONTENT_TYPE,
-            "text/plain; version=0.0.4; charset=utf-8",
-        )
-        .body(Body::from(body))
-        .unwrap_or_else(|e| {
-            error_response(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                format!("failed to build metrics response: {e}"),
-                "internal_error",
-                "response_build_failed",
-            )
-        })
 }
 
 /// Build an OpenAI-compatible chat completion response from the final pipeline output.
