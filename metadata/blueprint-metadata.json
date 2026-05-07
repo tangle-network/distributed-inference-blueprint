@@ -1,0 +1,203 @@
+{
+  "name": "Distributed Inference Blueprint",
+  "description": "Pipeline-parallel inference for very large models split across multiple Tangle operators, with layer assignment, activation forwarding, and proportional payment splits.",
+  "author": "Tangle Network",
+  "category": "AI Inference",
+  "image": null,
+  "website": "https://tangle.tools",
+  "codeRepository": "https://github.com/tangle-network/distributed-inference-blueprint",
+  "docs": "https://github.com/tangle-network/distributed-inference-blueprint#readme",
+  "integrity": null,
+  "blueprintUi": {
+    "displayName": "Distributed Inference",
+    "description": "Create and inspect multi-operator inference pipelines with layer ranges, peer connectivity, activation events, and pipeline-level health metrics.",
+    "requestedSlug": "distributed-inference",
+    "publisher": {
+      "name": "Tangle Network",
+      "namespace": "tangle",
+      "verified": false
+    },
+    "resources": {
+      "serviceLabel": "Pipeline",
+      "itemLabel": "Stage",
+      "itemRoute": "agents"
+    },
+    "surfaces": [
+      "generic-overview",
+      "service-explorer",
+      "actions-panel",
+      "resources",
+      "metrics",
+      "permissions"
+    ],
+    "theme": {
+      "badgeLabel": "Multi-operator pipeline",
+      "accentColor": "#0891B2",
+      "secondaryColor": "#083344",
+      "icon": "graph"
+    },
+    "overviewCards": [
+      {
+        "id": "pipeline-scale",
+        "kind": "callout",
+        "title": "400B+ pipeline parallelism",
+        "description": "Split massive language models across multiple operators, each serving a contiguous layer range with activation forwarding and on-chain settlement of proportional payments.",
+        "tone": "success"
+      },
+      {
+        "id": "supported-models",
+        "kind": "checklist",
+        "title": "Supported architectures",
+        "items": [
+          "Llama 3.1 405B (126 layers)",
+          "Mixtral 8x22B (56 layers)",
+          "Llama 3.1 70B (80 layers)",
+          "DeepSeek-V2 (60 layers)"
+        ],
+        "tone": "info"
+      },
+      {
+        "id": "pipeline-health",
+        "kind": "stat",
+        "title": "Pipeline status",
+        "description": "Peer connectivity, layer coverage, and TEE activation signing.",
+        "value": "All stages online",
+        "tone": "neutral"
+      }
+    ],
+    "actions": [
+      {
+        "id": "create-inference-pipeline",
+        "label": "Create pipeline",
+        "description": "Initialize a new multi-stage inference pipeline for a model, specifying total layers and minimum operator count. Registers the pipeline on-chain for layer assignment.",
+        "target": "service",
+        "submitLabel": "Create",
+        "fields": [
+          {
+            "key": "model_id",
+            "label": "Model ID",
+            "input": "text",
+            "required": true,
+            "placeholder": "meta-llama/Llama-3.1-405B-Instruct"
+          },
+          {
+            "key": "total_layers",
+            "label": "Total layers",
+            "input": "number",
+            "required": true,
+            "placeholder": "126"
+          },
+          {
+            "key": "min_operators",
+            "label": "Minimum operators",
+            "input": "number",
+            "required": true,
+            "placeholder": "4"
+          }
+        ]
+      },
+      {
+        "id": "join-pipeline-stage",
+        "label": "Join as stage",
+        "description": "Register an operator to serve a contiguous layer range. Operator downloads weights for only its assigned layers, sets up peer networking, and begins receiving activations.",
+        "target": "resource",
+        "submitLabel": "Join",
+        "fields": [
+          {
+            "key": "pipeline_id",
+            "label": "Pipeline ID",
+            "input": "text",
+            "required": true,
+            "placeholder": "pipeline_xyz"
+          },
+          {
+            "key": "layer_range",
+            "label": "Layer assignment mode",
+            "input": "select",
+            "required": true,
+            "options": [
+              {
+                "label": "Manual start/end",
+                "value": "manual"
+              },
+              {
+                "label": "Auto-assign next range",
+                "value": "auto"
+              }
+            ]
+          },
+          {
+            "key": "layer_start",
+            "label": "Layer start (manual mode)",
+            "input": "number",
+            "required": false,
+            "placeholder": "32"
+          }
+        ]
+      }
+    ],
+    "resourceViews": [
+      {
+        "id": "pipeline-stages",
+        "title": "Pipeline stages",
+        "kind": "table",
+        "target": "resource",
+        "defaultSort": "layer_start:asc",
+        "columns": [
+          {
+            "key": "stage",
+            "label": "Stage",
+            "emphasis": true
+          },
+          {
+            "key": "operator",
+            "label": "Operator"
+          },
+          {
+            "key": "layers",
+            "label": "Layers"
+          },
+          {
+            "key": "peer_state",
+            "label": "Peer state"
+          },
+          {
+            "key": "latency",
+            "label": "Latency"
+          }
+        ]
+      }
+    ],
+    "modules": [
+      {
+        "module": "metrics-overview",
+        "slot": "overview",
+        "metricKeys": [
+          "layers_served",
+          "pipeline_latency_ms",
+          "upstream_connected"
+        ]
+      },
+      {
+        "module": "service-health",
+        "slot": "sidebar",
+        "eventKinds": [
+          "pipeline_created",
+          "stage_joined",
+          "downstream_connected",
+          "activation_forwarded"
+        ]
+      },
+      {
+        "module": "resource-events",
+        "slot": "resources",
+        "eventKinds": [
+          "pipeline_requests_processed",
+          "layer_assignment_complete",
+          "peer_handshake_success",
+          "payment_split_executed"
+        ]
+      }
+    ]
+  }
+}
