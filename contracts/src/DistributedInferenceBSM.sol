@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: MIT
-pragma solidity ^0.8.24;
+pragma solidity ^0.8.26;
+
+import { BlueprintServiceManagerBase } from "tnt-core/BlueprintServiceManagerBase.sol";
 
 /// @title DistributedInferenceBSM
 /// @notice Multi-operator Blueprint Service Manager for pipeline-parallel inference.
@@ -7,7 +9,14 @@ pragma solidity ^0.8.24;
 /// forming a pipeline that can serve models too large for a single GPU (e.g., Llama 405B).
 ///
 /// Payment is split proportionally by the fraction of layers each operator serves.
-contract DistributedInferenceBSM {
+///
+/// @dev Inherits {BlueprintServiceManagerBase} so the contract exposes the
+/// `IBlueprintServiceManager` surface that Tangle invokes at blueprint
+/// registration time (`onBlueprintCreated`) and on every operator/service
+/// lifecycle hook. Without that inheritance, `Tangle.createBlueprint(def)`
+/// would revert with `ManagerRejected(manager)` because the BSM would have
+/// no `onBlueprintCreated` selector to receive.
+contract DistributedInferenceBSM is BlueprintServiceManagerBase {
     // --- Structs ---
 
     struct PipelineGroup {
@@ -74,14 +83,62 @@ contract DistributedInferenceBSM {
     error InsufficientVram(address operator, uint32 required, uint32 available);
     error OperatorNotInPipeline(uint64 pipelineId, address operator);
 
-    // --- Registration ---
+    // --- Constructor ---
 
-    /// Called during operator registration. Decodes the ABI-encoded registration
-    /// payload and stores operator capabilities.
+    /// @param _tangleCore Tangle protocol address. If non-zero, this binds the BSM to that
+    ///        Tangle deployment up-front (so Tangle's own `onBlueprintCreated` call during
+    ///        `createBlueprint` is a no-op rebind to the same address; see
+    ///        {onBlueprintCreated} below). Passing `address(0)` defers binding to Tangle.
+    constructor(address _tangleCore) {
+        tangleCore = _tangleCore;
+    }
+
+    // --- Blueprint Lifecycle ---
+
+    /// @notice Tangle dispatches this from `createBlueprint`. The base implementation reverts
+    ///         with `AlreadyInitialized` if `tangleCore` is already set, which would happen
+    ///         here because the constructor pre-binds it. Override to be idempotent: accept
+    ///         a rebind to the same Tangle, record `blueprintId` + `blueprintOwner`.
+    /// @dev    Without this override, Tangle's hook call reverts and `createBlueprint` aborts
+    ///         with `ManagerRejected(manager)` (selector 0x71cc0e9a).
+    function onBlueprintCreated(
+        uint64 _blueprintId,
+        address _owner,
+        address _tangleCore
+    )
+        external
+        override
+    {
+        // First-bind path: constructor was given address(0), let Tangle bind itself.
+        if (tangleCore == address(0)) {
+            require(msg.sender == _tangleCore, "not tangle");
+            tangleCore = _tangleCore;
+        } else {
+            // Pre-bound path: only accept the rebind if Tangle matches what the deployer set.
+            require(msg.sender == tangleCore, "not tangle");
+            require(_tangleCore == tangleCore, "tangle mismatch");
+        }
+
+        blueprintId = _blueprintId;
+        blueprintOwner = _owner;
+    }
+
+    // --- Operator Registration ---
+
+    /// @notice Called during operator registration. Decodes the ABI-encoded registration
+    ///         payload and stores operator capabilities.
+    /// @dev    Overrides {BlueprintServiceManagerBase.onRegister}; must remain `external payable`
+    ///         and use the base `onlyFromTangle` modifier (tangle-only) to keep the
+    ///         {IBlueprintServiceManager} ABI intact.
     function onRegister(
         address operator,
         bytes calldata registrationInputs
-    ) external {
+    )
+        external
+        payable
+        override
+        onlyFromTangle
+    {
         (
             , // modelId (string) — not stored globally
             uint32 layerStart,
