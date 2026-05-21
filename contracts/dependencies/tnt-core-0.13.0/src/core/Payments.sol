@@ -1,0 +1,645 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import { EnumerableSet } from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+
+import { Base } from "./Base.sol";
+import { PaymentsEffectiveExposure } from "./PaymentsEffectiveExposure.sol";
+import { Types } from "../libraries/Types.sol";
+import { Errors } from "../libraries/Errors.sol";
+import { PaymentLib } from "../libraries/PaymentLib.sol";
+import { IBlueprintServiceManager } from "../interfaces/IBlueprintServiceManager.sol";
+import { IServiceFeeDistributor } from "../interfaces/IServiceFeeDistributor.sol";
+import { IStaking } from "../interfaces/IStaking.sol";
+
+/// @title Payments
+/// @notice Payment distribution, escrow, and rewards
+/// @dev TIMESTAMP ASSUMPTIONS:
+///      - block.timestamp is used for subscription billing intervals and TTL checks
+///      - Miners can manipulate timestamps by ~15 seconds on Ethereum
+///      - This tolerance is acceptable for billing intervals (typically hours/days)
+///      - For critical time-sensitive operations, consider using block numbers instead
+///      - TTL expiry and subscription intervals use timestamps for user-friendliness
+/// @dev PAYMENT DISTRIBUTION:
+///      - Operator payments are proportional to effective exposure (delegation × exposureBps)
+///      - This ensures operators are paid based on actual security capital at risk
+///      - If price oracle is configured, cross-asset values are normalized to USD
+abstract contract Payments is Base, PaymentsEffectiveExposure {
+    using EnumerableSet for EnumerableSet.AddressSet;
+    using PaymentLib for PaymentLib.ServiceEscrow;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EVENTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    event EscrowFunded(uint64 indexed serviceId, address indexed token, uint256 amount);
+    event EscrowRefunded(uint64 indexed serviceId, address indexed owner, address indexed token, uint256 amount);
+    event SubscriptionBilled(uint64 indexed serviceId, uint256 amount, uint64 period);
+    event PaymentDistributed(
+        uint64 indexed serviceId,
+        uint64 indexed blueprintId,
+        address indexed token,
+        uint256 grossAmount,
+        address developerRecipient,
+        uint256 developerAmount,
+        uint256 protocolAmount,
+        uint256 operatorPoolAmount,
+        uint256 stakerPoolAmount
+    );
+    event OperatorRewardAccrued(
+        uint64 indexed serviceId, address indexed operator, address indexed token, uint64 blueprintId, uint256 amount
+    );
+    event RewardsClaimed(address indexed account, address indexed token, uint256 amount);
+    event TntPaymentDiscountApplied(
+        uint64 indexed serviceId, address indexed recipient, address indexed token, uint256 amount
+    );
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ESCROW MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Fund a service's escrow.
+    /// @dev Re-checks (a) the service hasn't expired and (b) the blueprint manager still
+    ///      whitelists the escrow's payment token. Without these checks a service could
+    ///      be funded after expiry (escrow stuck) or after a manager policy revoke
+    ///      (ongoing top-ups for a token the protocol now disallows).
+    function fundService(uint64 serviceId, uint256 amount) external payable whenNotPaused nonReentrant {
+        Types.Service storage svc = _getService(serviceId);
+        if (svc.status != Types.ServiceStatus.Active) {
+            revert Errors.ServiceNotActive(serviceId);
+        }
+        if (svc.pricing != Types.PricingModel.Subscription) {
+            revert Errors.InvalidState();
+        }
+        if (svc.ttl > 0 && block.timestamp > svc.createdAt + svc.ttl) {
+            revert Errors.ServiceExpired(serviceId);
+        }
+
+        PaymentLib.ServiceEscrow storage escrow = _serviceEscrows[serviceId];
+        address token = escrow.token;
+
+        Types.Blueprint storage bp = _blueprints[svc.blueprintId];
+        if (bp.manager != address(0) && !_isPaymentAssetAllowedByManager(bp.manager, serviceId, token)) {
+            revert Errors.TokenNotAllowed(token);
+        }
+
+        PaymentLib.depositToEscrow(escrow, token, amount, msg.value);
+
+        emit EscrowFunded(serviceId, token, amount);
+        _recordPayment(msg.sender, serviceId, token, amount);
+    }
+
+    /// @notice Withdraw remaining escrow balance after service termination
+    function withdrawRemainingEscrow(uint64 serviceId) external nonReentrant {
+        Types.Service storage svc = _getService(serviceId);
+        if (svc.owner != msg.sender) {
+            revert Errors.NotServiceOwner(serviceId, msg.sender);
+        }
+        if (svc.status != Types.ServiceStatus.Terminated) {
+            revert Errors.ServiceNotTerminated(serviceId);
+        }
+
+        PaymentLib.ServiceEscrow storage escrow = _serviceEscrows[serviceId];
+        uint256 remaining = escrow.balance;
+        if (remaining == 0) revert Errors.ZeroAmount();
+
+        address token = escrow.token;
+        escrow.balance = 0;
+        escrow.totalReleased += remaining;
+
+        PaymentLib.transferPayment(svc.owner, token, remaining);
+        emit EscrowRefunded(serviceId, svc.owner, token, remaining);
+    }
+
+    /// @notice Bill a subscription service
+    /// @dev Anyone can call this to trigger billing; no incentive for single billing
+    function billSubscription(uint64 serviceId) external whenNotPaused nonReentrant {
+        _billSubscriptionInternal(serviceId);
+    }
+
+    /// @notice Batch bill multiple subscription services
+    /// @dev Recipients (operators, developers, stakers) are naturally incentivized to call this
+    /// @param serviceIds Array of service IDs to bill
+    /// @return totalBilled Total amount billed across all services
+    /// @return billedCount Number of services successfully billed
+    function billSubscriptionBatch(uint64[] calldata serviceIds)
+        external
+        whenNotPaused
+        nonReentrant
+        returns (uint256 totalBilled, uint256 billedCount)
+    {
+        uint256 serviceIdsLength = serviceIds.length;
+        if (serviceIdsLength == 0) revert Errors.ZeroAmount();
+
+        for (uint256 i = 0; i < serviceIdsLength;) {
+            if (_tryBillSubscription(serviceIds[i])) {
+                Types.BlueprintConfig storage bpConfig = _blueprintConfigs[_services[serviceIds[i]].blueprintId];
+                totalBilled += bpConfig.subscriptionRate;
+                billedCount++;
+            }
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @notice Get services that are billable (past their billing interval)
+    /// @param serviceIds Array of service IDs to check
+    /// @return billable Array of service IDs that can be billed
+    function getBillableServices(uint64[] calldata serviceIds) external view returns (uint64[] memory billable) {
+        uint256 serviceIdsLength = serviceIds.length;
+        uint64[] memory temp = new uint64[](serviceIdsLength);
+        uint256 count = 0;
+
+        for (uint256 i = 0; i < serviceIdsLength;) {
+            if (_isBillable(serviceIds[i])) {
+                temp[count++] = serviceIds[i];
+            }
+            unchecked {
+                ++i;
+            }
+        }
+
+        billable = new uint64[](count);
+        for (uint256 i = 0; i < count;) {
+            billable[i] = temp[i];
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @notice Internal billing logic with TTL check
+    /// @dev Uses effective exposure (delegation × exposureBps) for proportional payment distribution
+    function _billSubscriptionInternal(uint64 serviceId) internal {
+        Types.Service storage svc = _getService(serviceId);
+        if (svc.status != Types.ServiceStatus.Active) {
+            revert Errors.ServiceNotActive(serviceId);
+        }
+        if (svc.pricing != Types.PricingModel.Subscription) {
+            revert Errors.InvalidState();
+        }
+
+        // TTL check - cannot bill expired services
+        if (svc.ttl > 0 && block.timestamp > svc.createdAt + svc.ttl) {
+            revert Errors.ServiceExpired(serviceId);
+        }
+
+        Types.BlueprintConfig storage bpConfig = _blueprintConfigs[svc.blueprintId];
+        uint64 interval = bpConfig.subscriptionInterval;
+        uint256 rate = bpConfig.subscriptionRate;
+
+        if (block.timestamp < svc.lastPaymentAt + interval) {
+            revert Errors.DeadlineExpired();
+        }
+
+        PaymentLib.ServiceEscrow storage escrow = _serviceEscrows[serviceId];
+        if (escrow.balance < rate) {
+            revert Errors.InsufficientEscrowBalance(rate, escrow.balance);
+        }
+
+        address token = PaymentLib.releaseFromEscrow(escrow, rate);
+        // Advance by exactly one interval so missed periods can be caught up over repeated calls.
+        svc.lastPaymentAt += interval;
+
+        address[] memory operators = _activeServiceOperators(serviceId);
+
+        // Calculate effective exposures (with fallback to stored exposureBps)
+        (uint256[] memory effectiveExposures, uint256 totalEffectiveExposure, bool hasSecurityCommitments) =
+            _calculateEffectiveExposuresWithFallback(serviceId, operators);
+
+        _distributePaymentWithEffectiveExposure(
+            serviceId,
+            svc.blueprintId,
+            token,
+            rate,
+            operators,
+            effectiveExposures,
+            totalEffectiveExposure,
+            hasSecurityCommitments
+        );
+
+        emit SubscriptionBilled(serviceId, rate, interval);
+    }
+
+    /// @notice Try to bill a subscription, returns false on failure instead of reverting
+    /// @dev Uses effective exposure (delegation × exposureBps) for proportional payment distribution
+    function _tryBillSubscription(uint64 serviceId) internal returns (bool) {
+        if (!_isBillable(serviceId)) return false;
+
+        Types.Service storage svc = _services[serviceId];
+        Types.BlueprintConfig storage bpConfig = _blueprintConfigs[svc.blueprintId];
+        PaymentLib.ServiceEscrow storage escrow = _serviceEscrows[serviceId];
+
+        uint256 rate = bpConfig.subscriptionRate;
+        if (escrow.balance < rate) return false;
+
+        address token = PaymentLib.releaseFromEscrow(escrow, rate);
+        // Advance by exactly one interval so missed periods can be caught up over repeated calls.
+        svc.lastPaymentAt += bpConfig.subscriptionInterval;
+
+        address[] memory operators = _activeServiceOperators(serviceId);
+
+        // Calculate effective exposures (with fallback to stored exposureBps)
+        (uint256[] memory effectiveExposures, uint256 totalEffectiveExposure, bool hasSecurityCommitments) =
+            _calculateEffectiveExposuresWithFallback(serviceId, operators);
+
+        _distributePaymentWithEffectiveExposure(
+            serviceId,
+            svc.blueprintId,
+            token,
+            rate,
+            operators,
+            effectiveExposures,
+            totalEffectiveExposure,
+            hasSecurityCommitments
+        );
+
+        emit SubscriptionBilled(serviceId, rate, bpConfig.subscriptionInterval);
+        return true;
+    }
+
+    /// @notice Check if a service is billable
+    function _isBillable(uint64 serviceId) internal view returns (bool) {
+        Types.Service storage svc = _services[serviceId];
+
+        // Must be active subscription
+        if (svc.status != Types.ServiceStatus.Active) return false;
+        if (svc.pricing != Types.PricingModel.Subscription) return false;
+
+        // Must not be expired (TTL check)
+        if (svc.ttl > 0 && block.timestamp > svc.createdAt + svc.ttl) return false;
+
+        // Must be past billing interval
+        Types.BlueprintConfig storage bpConfig = _blueprintConfigs[svc.blueprintId];
+        if (block.timestamp < svc.lastPaymentAt + bpConfig.subscriptionInterval) return false;
+        if (_serviceEscrows[serviceId].balance < bpConfig.subscriptionRate) return false;
+
+        return true;
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // REWARDS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Claim pending rewards (native token)
+    function claimRewards() external nonReentrant {
+        _claimRewardsToken(msg.sender, address(0), false);
+    }
+
+    /// @notice Claim pending rewards for specific token
+    function claimRewards(address token) external nonReentrant {
+        _claimRewardsToken(msg.sender, token, false);
+    }
+
+    /// @notice Claim pending rewards for multiple tokens
+    function claimRewardsBatch(address[] calldata tokens) external nonReentrant {
+        uint256 tokensLength = tokens.length;
+        for (uint256 i = 0; i < tokensLength;) {
+            _claimRewardsToken(msg.sender, tokens[i], false);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    /// @notice Claim pending rewards for all tokens tracked for the caller
+    function claimRewardsAll() external nonReentrant {
+        EnumerableSet.AddressSet storage set = _pendingRewardTokens[msg.sender];
+        while (set.length() > 0) {
+            address token = set.at(set.length() - 1);
+            _claimRewardsToken(msg.sender, token, true);
+        }
+    }
+
+    /// @notice Get pending rewards
+    function pendingRewards(address account) external view returns (uint256) {
+        return _pendingRewards[account][address(0)];
+    }
+
+    /// @notice Get pending rewards for token
+    function pendingRewards(address account, address token) external view returns (uint256) {
+        return _pendingRewards[account][token];
+    }
+
+    /// @notice Return the set of tokens with non-zero pending operator rewards for an account
+    function rewardTokens(address account) external view returns (address[] memory tokens) {
+        EnumerableSet.AddressSet storage set = _pendingRewardTokens[account];
+        uint256 setLength = set.length();
+        tokens = new address[](setLength);
+        for (uint256 i = 0; i < setLength;) {
+            tokens[i] = set.at(i);
+            unchecked {
+                ++i;
+            }
+        }
+    }
+
+    function _claimRewardsToken(address account, address token, bool forceRemove) private {
+        uint256 claimed = PaymentLib.claimPendingReward(_pendingRewards, account, token);
+        if (claimed > 0) {
+            _pendingRewardTokens[account].remove(token);
+            emit RewardsClaimed(account, token, claimed);
+        } else if (forceRemove) {
+            _pendingRewardTokens[account].remove(token);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // ADMIN
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Set payment split
+    /// @param split The new payment split configuration
+    function setPaymentSplit(Types.PaymentSplit calldata split) external onlyRole(ADMIN_ROLE) {
+        PaymentLib.validateSplit(split);
+        _paymentSplit = split;
+        emit PaymentSplitUpdated(split.developerBps, split.protocolBps, split.operatorBps, split.stakerBps);
+    }
+
+    /// @notice Set treasury
+    /// @param treasury_ The new treasury address
+    function setTreasury(address payable treasury_) external onlyRole(ADMIN_ROLE) {
+        if (treasury_ == address(0)) revert Errors.ZeroAddress();
+        _treasury = treasury_;
+        emit TreasuryUpdated(treasury_);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // VIEW
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    function paymentSplit() external view returns (uint16, uint16, uint16, uint16) {
+        return
+            (_paymentSplit.developerBps, _paymentSplit.protocolBps, _paymentSplit.operatorBps, _paymentSplit.stakerBps);
+    }
+
+    function treasury() external view returns (address payable) {
+        return _treasury;
+    }
+
+    function getServiceEscrow(uint64 serviceId) external view returns (PaymentLib.ServiceEscrow memory) {
+        return _serviceEscrows[serviceId];
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // INTERNAL
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Deposit to escrow
+    function _depositToEscrow(uint64 serviceId, address token, uint256 amount) internal {
+        PaymentLib.ServiceEscrow storage escrow = _serviceEscrows[serviceId];
+        escrow.token = token;
+        escrow.balance += amount;
+        escrow.totalDeposited += amount;
+        emit EscrowFunded(serviceId, token, amount);
+    }
+
+    /// @notice Distribute payment to all stakeholders using effective exposures
+    /// @dev Operators ALWAYS get paid for providing compute. When no stakers exist
+    ///      (hasSecurityCommitments == false), the staker share is merged into the
+    ///      operator pool. Customers set minimum exposureBps to prevent gaming.
+    /// @param serviceId The service ID
+    /// @param blueprintId The blueprint ID
+    /// @param token Payment token
+    /// @param amount Total payment amount
+    /// @param operators Array of operator addresses
+    /// @param effectiveExposures Array of effective exposure values (delegation × exposureBps)
+    /// @param totalEffectiveExposure Sum of all effective exposures
+    /// @param hasSecurityCommitments True when real delegated stake backs operators
+    function _distributePaymentWithEffectiveExposure(
+        uint64 serviceId,
+        uint64 blueprintId,
+        address token,
+        uint256 amount,
+        address[] memory operators,
+        uint256[] memory effectiveExposures,
+        uint256 totalEffectiveExposure,
+        bool hasSecurityCommitments
+    )
+        internal
+    {
+        if (amount == 0) return;
+
+        uint256 operatorsLength = operators.length;
+        // Refuse to distribute when no operators are running the service: dev and
+        // treasury were getting paid while the operator+staker pool (default 60%)
+        // was retained by the contract with no path back. Service owners recover
+        // escrow via terminate -> withdrawRemainingEscrow once operators leave.
+        if (operatorsLength == 0) {
+            revert Errors.NoOperators();
+        }
+
+        // M-5 FIX: Validate payment amount is sufficient to prevent rounding to zero
+        PaymentLib.validatePaymentAmount(amount, _paymentSplit, operatorsLength);
+
+        Types.Blueprint storage bp = _blueprints[blueprintId];
+        Types.Service storage svc = _services[serviceId];
+
+        PaymentLib.PaymentAmounts memory amounts = PaymentLib.calculateSplit(amount, _paymentSplit);
+
+        // Developer payment
+        address developerAddr = bp.owner;
+        if (bp.manager != address(0)) {
+            try IBlueprintServiceManager(bp.manager).queryDeveloperPaymentAddress(serviceId) returns (
+                address payable devAddr
+            ) {
+                if (devAddr != address(0)) developerAddr = devAddr;
+            } catch { }
+        }
+        PaymentLib.transferPayment(developerAddr, token, amounts.developerAmount);
+
+        // TNT payment discount (funded from protocol share; sent to service owner)
+        if (
+            token != address(0) && token == _tntToken && _tntPaymentDiscountBps > 0 && amounts.protocolAmount > 0
+                && svc.owner != address(0)
+        ) {
+            uint256 desiredDiscount = (amount * _tntPaymentDiscountBps) / BPS_DENOMINATOR;
+            uint256 discount = desiredDiscount > amounts.protocolAmount ? amounts.protocolAmount : desiredDiscount;
+            if (discount > 0) {
+                amounts.protocolAmount -= discount;
+                PaymentLib.transferPayment(svc.owner, token, discount);
+                emit TntPaymentDiscountApplied(serviceId, svc.owner, token, discount);
+            }
+        }
+
+        // Protocol payment
+        PaymentLib.transferPayment(_treasury, token, amounts.protocolAmount);
+
+        uint256 operatorPoolAmount =
+            operatorsLength == 0 ? 0 : amounts.operatorAmount + (hasSecurityCommitments ? 0 : amounts.stakerAmount);
+        uint256 stakerPoolAmount = operatorsLength == 0 ? 0 : (hasSecurityCommitments ? amounts.stakerAmount : 0);
+
+        emit PaymentDistributed(
+            serviceId,
+            blueprintId,
+            token,
+            amount,
+            developerAddr,
+            amounts.developerAmount,
+            amounts.protocolAmount,
+            operatorPoolAmount,
+            stakerPoolAmount
+        );
+
+        // Operator payments — operators always get paid for providing compute.
+        // When no stakers back operators, staker share merges into operator pool.
+        if (operatorsLength == 0) return;
+
+        if (totalEffectiveExposure > 0) {
+            // Proportional distribution based on exposure weights.
+            // If real stakers exist, keep staker share separate for the fee distributor.
+            // If no stakers, merge staker share into operator pool.
+            uint256 operatorPool =
+                hasSecurityCommitments ? amounts.operatorAmount : amounts.operatorAmount + amounts.stakerAmount;
+            uint256 stakerPool = hasSecurityCommitments ? amounts.stakerAmount : 0;
+
+            PaymentLib.OperatorPayment[] memory opPayments = PaymentLib.calculateOperatorPayments(
+                operatorPool, stakerPool, operators, effectiveExposures, totalEffectiveExposure
+            );
+
+            uint256 opPaymentsLength = opPayments.length;
+            for (uint256 i = 0; i < opPaymentsLength;) {
+                PaymentLib.addPendingReward(_pendingRewards, opPayments[i].operator, token, opPayments[i].operatorShare);
+                if (opPayments[i].operatorShare > 0) {
+                    _pendingRewardTokens[opPayments[i].operator].add(token);
+                    emit OperatorRewardAccrued(
+                        serviceId, opPayments[i].operator, token, blueprintId, opPayments[i].operatorShare
+                    );
+                }
+
+                if (opPayments[i].stakerShare > 0) {
+                    _forwardStakerShare(
+                        serviceId, blueprintId, opPayments[i].operator, token, opPayments[i].stakerShare
+                    );
+                }
+                unchecked {
+                    ++i;
+                }
+            }
+        } else {
+            // No exposure basis at all (all operators have 0% exposureBps).
+            // Equal distribution of (operator + staker) pool among all operators.
+            uint256 totalPool = amounts.operatorAmount + amounts.stakerAmount;
+            uint256 perOperator = totalPool / operatorsLength;
+            uint256 distributed = 0;
+
+            for (uint256 i = 0; i < operatorsLength;) {
+                uint256 share = (i == operatorsLength - 1)
+                    ? totalPool - distributed  // last operator gets rounding dust
+                    : perOperator;
+
+                PaymentLib.addPendingReward(_pendingRewards, operators[i], token, share);
+                if (share > 0) {
+                    _pendingRewardTokens[operators[i]].add(token);
+                    emit OperatorRewardAccrued(serviceId, operators[i], token, blueprintId, share);
+                }
+                distributed += share;
+                unchecked {
+                    ++i;
+                }
+            }
+        }
+    }
+
+    function _forwardStakerShare(
+        uint64 serviceId,
+        uint64 blueprintId,
+        address operator,
+        address token,
+        uint256 amount
+    )
+        private
+    {
+        address distributor = _serviceFeeDistributor;
+        if (distributor == address(0)) {
+            PaymentLib.transferPayment(_treasury, token, amount);
+            return;
+        }
+
+        if (token == address(0)) {
+            IServiceFeeDistributor(distributor).distributeServiceFee{ value: amount }(
+                serviceId, blueprintId, operator, token, amount
+            );
+        } else {
+            PaymentLib.transferPayment(distributor, token, amount);
+            IServiceFeeDistributor(distributor).distributeServiceFee(serviceId, blueprintId, operator, token, amount);
+        }
+    }
+
+    /// @dev Returns only operators currently active in the service. Operators that left
+    ///      remain in the EnumerableSet for historical accounting; we must not pay them.
+    function _activeServiceOperators(uint64 serviceId) internal view returns (address[] memory active) {
+        address[] memory all = _serviceOperatorSet[serviceId].values();
+        uint256 activeCount;
+        for (uint256 i = 0; i < all.length; ++i) {
+            if (_serviceOperators[serviceId][all[i]].active) activeCount++;
+        }
+        active = new address[](activeCount);
+        uint256 j;
+        for (uint256 i = 0; i < all.length; ++i) {
+            if (_serviceOperators[serviceId][all[i]].active) {
+                active[j++] = all[i];
+            }
+        }
+    }
+
+    /// @notice Calculate effective exposures with fallback to stored exposureBps
+    /// @dev When operators have no security commitments (common case), falls back to
+    ///      the exposureBps stored on their ServiceOperator record for proportional distribution.
+    /// @return effectiveExposures Per-operator exposure weights
+    /// @return totalEffectiveExposure Sum of all weights
+    /// @return hasSecurityCommitments True when real delegated stake backs the operators (stakers exist)
+    function _calculateEffectiveExposuresWithFallback(
+        uint64 serviceId,
+        address[] memory operators
+    )
+        internal
+        view
+        returns (uint256[] memory effectiveExposures, uint256 totalEffectiveExposure, bool hasSecurityCommitments)
+    {
+        (effectiveExposures, totalEffectiveExposure) = _calculateEffectiveExposures(serviceId, operators);
+
+        // If commitment-based calculation found real delegated stake, stakers are backing operators
+        hasSecurityCommitments = totalEffectiveExposure > 0;
+
+        // Fallback: when no security commitments exist, use stored exposureBps as weights.
+        if (totalEffectiveExposure == 0 && operators.length > 0) {
+            uint16[] memory bps = new uint16[](operators.length);
+            for (uint256 i = 0; i < operators.length;) {
+                bps[i] = _serviceOperators[serviceId][operators[i]].exposureBps;
+                unchecked {
+                    ++i;
+                }
+            }
+            (effectiveExposures, totalEffectiveExposure) = _calculateSimpleExposures(operators, bps);
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EFFECTIVE EXPOSURE INTERFACE IMPLEMENTATIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @inheritdoc PaymentsEffectiveExposure
+    function _getStaking() internal view override returns (IStaking) {
+        return _staking;
+    }
+
+    /// @inheritdoc PaymentsEffectiveExposure
+    function _getPriceOracle() internal view override returns (address) {
+        return _priceOracle;
+    }
+
+    /// @inheritdoc PaymentsEffectiveExposure
+    function _getServiceSecurityCommitments(
+        uint64 serviceId,
+        address operator
+    )
+        internal
+        view
+        override
+        returns (Types.AssetSecurityCommitment[] storage)
+    {
+        return _serviceSecurityCommitments[serviceId][operator];
+    }
+}

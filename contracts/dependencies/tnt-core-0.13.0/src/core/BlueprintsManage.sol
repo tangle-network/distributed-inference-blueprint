@@ -1,0 +1,206 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import { Base } from "./Base.sol";
+import { Types } from "../libraries/Types.sol";
+import { Errors } from "../libraries/Errors.sol";
+
+/// @title BlueprintsManage
+/// @notice Blueprint reads and ownership management
+abstract contract BlueprintsManage is Base {
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EVENTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    event BlueprintUpdated(uint64 indexed blueprintId, string metadataUri, bytes32 metadataHash);
+    event BlueprintTransferred(uint64 indexed blueprintId, address indexed from, address indexed to);
+    event BlueprintDeactivated(uint64 indexed blueprintId);
+    event JobEventRateSet(uint64 indexed blueprintId, uint8 indexed jobIndex, uint256 rate);
+    event BlueprintResourceRequirementsSet(uint64 indexed blueprintId, uint256 count);
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BLUEPRINT MANAGEMENT
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Get current blueprint count
+    function blueprintCount() external view returns (uint64) {
+        return _blueprintCount;
+    }
+
+    /// @notice Get blueprint metadata and URI
+    function blueprintMetadata(uint64 blueprintId)
+        external
+        view
+        returns (Types.BlueprintMetadata memory metadata, string memory metadataUri, bytes32 metadataHash)
+    {
+        metadata = _blueprintMetadata[blueprintId];
+        metadataUri = _blueprintMetadataUri[blueprintId];
+        metadataHash = _blueprintMetadataHash[blueprintId];
+    }
+
+    /// @notice Get blueprint sources
+    function blueprintSources(uint64 blueprintId) external view returns (Types.BlueprintSource[] memory sources) {
+        Types.BlueprintSource[] storage stored = _blueprintSources[blueprintId];
+        sources = new Types.BlueprintSource[](stored.length);
+        for (uint256 i = 0; i < stored.length; ++i) {
+            sources[i] = stored[i];
+        }
+    }
+
+    /// @notice Get blueprint supported membership models
+    function blueprintSupportedMemberships(uint64 blueprintId)
+        external
+        view
+        returns (Types.MembershipModel[] memory memberships)
+    {
+        Types.MembershipModel[] storage stored = _blueprintSupportedMemberships[blueprintId];
+        memberships = new Types.MembershipModel[](stored.length);
+        for (uint256 i = 0; i < stored.length; ++i) {
+            memberships[i] = stored[i];
+        }
+    }
+
+    /// @notice Get master blueprint revision
+    function blueprintMasterRevision(uint64 blueprintId) external view returns (uint32) {
+        return _blueprintMasterRevisions[blueprintId];
+    }
+
+    /// @notice Retrieve the original blueprint definition
+    function getBlueprintDefinition(uint64 blueprintId)
+        external
+        view
+        returns (Types.BlueprintDefinition memory definition)
+    {
+        bytes storage blob = _blueprintDefinitionBlobs[blueprintId];
+        if (blob.length == 0) revert Errors.BlueprintNotFound(blueprintId);
+        definition = abi.decode(blob, (Types.BlueprintDefinition));
+    }
+
+    /// @notice Update blueprint metadata
+    function updateBlueprint(uint64 blueprintId, string calldata metadataUri, bytes32 metadataHash)
+        external
+        nonReentrant
+    {
+        Types.Blueprint storage bp = _getBlueprint(blueprintId);
+        if (bp.owner != msg.sender) {
+            revert Errors.NotBlueprintOwner(blueprintId, msg.sender);
+        }
+        if (_blueprintMetadataLocked[blueprintId]) revert Errors.BlueprintMetadataLocked(blueprintId);
+        if (bytes(metadataUri).length == 0) revert Errors.BlueprintMetadataRequired();
+        if (metadataHash == bytes32(0)) revert Errors.BlueprintMetadataHashRequired();
+        _blueprintMetadataUri[blueprintId] = metadataUri;
+        _blueprintMetadataHash[blueprintId] = metadataHash;
+        emit BlueprintUpdated(blueprintId, metadataUri, metadataHash);
+    }
+
+    /// @notice Transfer blueprint ownership
+    function transferBlueprint(uint64 blueprintId, address newOwner) external nonReentrant {
+        if (newOwner == address(0)) revert Errors.ZeroAddress();
+
+        Types.Blueprint storage bp = _getBlueprint(blueprintId);
+        if (bp.owner != msg.sender) {
+            revert Errors.NotBlueprintOwner(blueprintId, msg.sender);
+        }
+
+        address oldOwner = bp.owner;
+        bp.owner = newOwner;
+        emit BlueprintTransferred(blueprintId, oldOwner, newOwner);
+    }
+
+    /// @notice Deactivate a blueprint
+    function deactivateBlueprint(uint64 blueprintId) external nonReentrant {
+        Types.Blueprint storage bp = _getBlueprint(blueprintId);
+        if (bp.owner != msg.sender) {
+            revert Errors.NotBlueprintOwner(blueprintId, msg.sender);
+        }
+
+        bp.active = false;
+        emit BlueprintDeactivated(blueprintId);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // PER-JOB PRICING
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Set event rate overrides for one or more job types in a blueprint
+    /// @param blueprintId The blueprint ID
+    /// @param jobIndexes Array of job indexes
+    /// @param rates Array of per-job event rates (0 to clear override and use blueprint default)
+    function setJobEventRates(uint64 blueprintId, uint8[] calldata jobIndexes, uint256[] calldata rates)
+        external
+        nonReentrant
+    {
+        if (jobIndexes.length != rates.length) revert Errors.LengthMismatch();
+
+        Types.Blueprint storage bp = _getBlueprint(blueprintId);
+        if (bp.owner != msg.sender) {
+            revert Errors.NotBlueprintOwner(blueprintId, msg.sender);
+        }
+
+        uint256 schemaCount = _blueprintJobSchemas[blueprintId].length;
+        for (uint256 i = 0; i < jobIndexes.length; i++) {
+            if (jobIndexes[i] >= schemaCount) {
+                revert Errors.InvalidJobIndex(jobIndexes[i]);
+            }
+            _jobEventRates[blueprintId][jobIndexes[i]] = rates[i];
+            emit JobEventRateSet(blueprintId, jobIndexes[i], rates[i]);
+        }
+    }
+
+    /// @notice Get the effective event rate for a specific job type
+    /// @param blueprintId The blueprint ID
+    /// @param jobIndex The job index
+    /// @return rate The per-job rate if set, otherwise the blueprint's default eventRate
+    function getJobEventRate(uint64 blueprintId, uint8 jobIndex) external view returns (uint256 rate) {
+        rate = _jobEventRates[blueprintId][jobIndex];
+        if (rate == 0) {
+            rate = _blueprintConfigs[blueprintId].eventRate;
+        }
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // BLUEPRINT RESOURCE REQUIREMENTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Set default resource requirements for a blueprint
+    /// @param blueprintId The blueprint ID
+    /// @param requirements Array of resource commitments (no duplicate kinds, all count > 0)
+    function setBlueprintResourceRequirements(
+        uint64 blueprintId,
+        Types.ResourceCommitment[] calldata requirements
+    )
+        external
+        nonReentrant
+    {
+        Types.Blueprint storage bp = _getBlueprint(blueprintId);
+        if (bp.owner != msg.sender) {
+            revert Errors.NotBlueprintOwner(blueprintId, msg.sender);
+        }
+
+        // Validate: no duplicate kinds, all counts > 0
+        delete _blueprintResourceRequirements[blueprintId];
+        for (uint256 i = 0; i < requirements.length; i++) {
+            if (requirements[i].count == 0) revert Errors.ZeroAmount();
+            // Check for duplicate kinds
+            for (uint256 j = 0; j < i; j++) {
+                if (requirements[j].kind == requirements[i].kind) {
+                    revert Errors.InvalidState();
+                }
+            }
+            _blueprintResourceRequirements[blueprintId].push(requirements[i]);
+        }
+
+        emit BlueprintResourceRequirementsSet(blueprintId, requirements.length);
+    }
+
+    /// @notice Get default resource requirements for a blueprint
+    /// @param blueprintId The blueprint ID
+    /// @return The array of resource commitments
+    function getBlueprintResourceRequirements(uint64 blueprintId)
+        external
+        view
+        returns (Types.ResourceCommitment[] memory)
+    {
+        return _blueprintResourceRequirements[blueprintId];
+    }
+}

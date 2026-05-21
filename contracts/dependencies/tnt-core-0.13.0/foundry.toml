@@ -1,0 +1,94 @@
+# Full reference https://github.com/foundry-rs/foundry/tree/master/config
+
+[profile.default]
+bytecode_hash = "none"
+fuzz = { runs = 1_000 }
+gas_reports = ["*"]
+libs = ["dependencies"]
+# optimizer = true (default)
+optimizer_runs = 200
+fs_permissions = [{ access = "read-write", path = "./" }]
+solc = "0.8.26"
+evm_version = "cancun"
+via_ir = true
+allow_internal_expect_revert = true
+
+[profile.fast]
+# Local iteration profile: much faster compile/test cycles.
+# Use with: `FOUNDRY_PROFILE=fast forge test ...`
+via_ir = true
+optimizer = false
+sparse_mode = true
+gas_reports = []
+fuzz = { runs = 256 }
+invariant = { runs = 64, depth = 64, fail_on_revert = true }
+
+[profile.local_build]
+# Local build-only profile that excludes tests and scripts from the compile graph.
+# Use with: `FOUNDRY_PROFILE=local_build forge build`
+via_ir = true
+optimizer = false
+sparse_mode = true
+gas_reports = []
+test = ".foundry/empty-test"
+script = ".foundry/empty-script"
+out = "out/local-build"
+cache_path = "cache/local-build"
+
+[profile.coverage]
+via_ir = true
+optimizer = true
+optimizer_runs = 200
+
+[profile.deploy_size]
+via_ir = true
+optimizer = true
+optimizer_runs = 1
+gas_reports = []
+
+[profile.ci]
+verbosity = 4
+
+[fmt]
+bracket_spacing = true
+int_types = "long"
+line_length = 120
+multiline_func_header = "all"
+number_underscore = "thousands"
+quote_style = "double"
+tab_width = 4
+wrap_comments = true
+
+
+[invariant]
+fail_on_revert = true
+runs = 256
+depth = 120
+
+[rpc_endpoints]
+# Uncomment to enable the RPC server
+arbitrum_goerli = "${ARBITRUM_GOERLI_RPC}"
+arbitrum = "${ARBITRUM_RPC}"
+mainnet = "${MAINNET_RPC}"
+sepolia = "${SEPOLIA_RPC}"
+holesky = "${HOLESKY_RPC}"
+base = "${BASE_RPC}"
+base-sepolia = "${BASE_SEPOLIA_RPC}"
+tangle_local = "${TANGLE_LOCAL_RPC}"
+tangle_testnet = "${TANGLE_TESTNET_RPC}"
+tangle_mainnet = "${TANGLE_MAINNET_RPC}"
+tempo_testnet = "${TEMPO_TESTNET_RPC}"
+tempo_mainnet = "${TEMPO_MAINNET_RPC}"
+
+[etherscan]
+sepolia = { key = "${SEPOLIA_KEY}" }
+holesky = { key = "${HOLESKY_KEY}" }
+base = { key = "${BASE_KEY}" }
+base-sepolia = { key = "${BASE_SEPOLIA_KEY}" }
+tangle_testnet = { key = "${TANGLE_TESTNET_KEY}", url = "https://testnet-explorer.tangle.tools" }
+tangle_mainnet = { key = "${TANGLE_MAINNET_KEY}", url = "https://explorer.tangle.tools" }
+
+[dependencies]
+forge-std = "1.9.4"
+"@openzeppelin-contracts" = "5.1.0"
+"@openzeppelin-contracts-upgradeable" = "5.1.0"
