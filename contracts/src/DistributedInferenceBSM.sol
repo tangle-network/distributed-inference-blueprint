@@ -111,9 +111,11 @@ contract DistributedInferenceBSM is BlueprintServiceManagerBase {
     {
         // First-bind path: constructor was given address(0), let Tangle bind itself.
         if (tangleCore == address(0)) {
+            require(msg.sender == _tangleCore, "not tangle");
             tangleCore = _tangleCore;
         } else {
             // Pre-bound path: only accept the rebind if Tangle matches what the deployer set.
+            require(msg.sender == tangleCore, "not tangle");
             require(_tangleCore == tangleCore, "tangle mismatch");
         }
 

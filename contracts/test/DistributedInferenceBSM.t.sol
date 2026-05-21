@@ -2,6 +2,7 @@
 pragma solidity ^0.8.26;
 
 import { Test } from "forge-std/Test.sol";
+import { BlueprintServiceManagerBase } from "tnt-core/BlueprintServiceManagerBase.sol";
 import { DistributedInferenceBSM } from "../src/DistributedInferenceBSM.sol";
 
 contract DistributedInferenceBSMTest is Test {
@@ -211,6 +212,84 @@ contract DistributedInferenceBSMTest is Test {
         assertTrue(active);
         assertTrue(totalVramMib > 0);
         assertTrue(bytes(endpoint).length > 0);
+    }
+
+    // --- Constructor & Lifecycle ---
+
+    function test_constructor_preBound() public view {
+        assertEq(bsm.tangleCore(), address(this));
+    }
+
+    function test_onBlueprintCreated_firstBind() public {
+        address tangle = address(0xabc);
+        DistributedInferenceBSM fresh = new DistributedInferenceBSM(address(0));
+
+        vm.prank(tangle);
+        fresh.onBlueprintCreated(1, address(this), tangle);
+
+        assertEq(fresh.tangleCore(), tangle);
+        assertEq(fresh.blueprintId(), 1);
+        assertEq(fresh.blueprintOwner(), address(this));
+    }
+
+    function test_onBlueprintCreated_preBound() public {
+        address tangle = address(0xabc);
+        DistributedInferenceBSM fresh = new DistributedInferenceBSM(tangle);
+
+        vm.prank(tangle);
+        fresh.onBlueprintCreated(1, address(this), tangle);
+
+        assertEq(fresh.blueprintId(), 1);
+        assertEq(fresh.blueprintOwner(), address(this));
+    }
+
+    function test_onBlueprintCreated_revert_notTangle_firstBind() public {
+        address tangle = address(0xabc);
+        DistributedInferenceBSM fresh = new DistributedInferenceBSM(address(0));
+
+        vm.prank(address(0xdead));
+        vm.expectRevert("not tangle");
+        fresh.onBlueprintCreated(1, address(this), tangle);
+    }
+
+    function test_onBlueprintCreated_revert_notTangle_preBound() public {
+        address tangle = address(0xabc);
+        DistributedInferenceBSM fresh = new DistributedInferenceBSM(tangle);
+
+        vm.prank(address(0xdead));
+        vm.expectRevert("not tangle");
+        fresh.onBlueprintCreated(1, address(this), tangle);
+    }
+
+    function test_onBlueprintCreated_revert_tangleMismatch() public {
+        address tangle = address(0xabc);
+        DistributedInferenceBSM fresh = new DistributedInferenceBSM(tangle);
+
+        vm.prank(tangle);
+        vm.expectRevert("tangle mismatch");
+        fresh.onBlueprintCreated(1, address(this), address(0xdef));
+    }
+
+    function test_onRegister_revert_notFromTangle() public {
+        bytes memory regData = abi.encode(
+            "meta-llama/Llama-3.1-405B",
+            uint32(0),
+            uint32(25),
+            uint32(100),
+            uint32(2),
+            uint32(80_000),
+            "https://op1.example.com"
+        );
+
+        vm.prank(address(0xdead));
+        vm.expectRevert(
+            abi.encodeWithSelector(
+                BlueprintServiceManagerBase.OnlyTangleAllowed.selector,
+                address(0xdead),
+                address(this)
+            )
+        );
+        bsm.onRegister(operator1, regData);
     }
 
     // --- View Functions ---
