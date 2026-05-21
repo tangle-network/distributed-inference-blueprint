@@ -1,0 +1,725 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.26;
+
+import { EnumerableSet } from "@openzeppelin/contracts/utils/structs/EnumerableSet.sol";
+
+import { Base } from "./Base.sol";
+import { Types } from "../libraries/Types.sol";
+import { Errors } from "../libraries/Errors.sol";
+import { IBlueprintServiceManager } from "../interfaces/IBlueprintServiceManager.sol";
+import { IServiceFeeDistributor } from "../interfaces/IServiceFeeDistributor.sol";
+import { IOperatorStatusRegistry } from "../staking/OperatorStatusRegistry.sol";
+
+/// @title ServicesLifecycle
+/// @notice Service lifecycle (join/exit) flows and views
+abstract contract ServicesLifecycle is Base {
+    using EnumerableSet for EnumerableSet.AddressSet;
+
+    uint64 internal constant DEFAULT_NON_PAYMENT_GRACE_INTERVALS = 1;
+    uint64 internal constant MAX_NON_PAYMENT_GRACE_INTERVALS = 12;
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EVENTS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    event ServiceTerminated(uint64 indexed serviceId);
+    event ServiceTerminatedForNonPayment(
+        uint64 indexed serviceId,
+        address indexed triggeredBy,
+        uint64 dueAt,
+        uint64 graceEndsAt,
+        uint256 requiredAmount,
+        uint256 escrowBalance
+    );
+    event OperatorJoinedService(uint64 indexed serviceId, address indexed operator, uint16 exposureBps);
+    event OperatorSecurityCommitmentsStored(uint64 indexed serviceId, address indexed operator, uint256 count);
+    event OperatorSecurityCommitment(
+        uint64 indexed serviceId, address indexed operator, uint8 assetKind, address asset, uint16 exposureBps
+    );
+    event OperatorLeftService(uint64 indexed serviceId, address indexed operator);
+    event ExitScheduled(uint64 indexed serviceId, address indexed operator, uint64 executeAfter);
+    event ExitCanceled(uint64 indexed serviceId, address indexed operator);
+    event ExitForced(uint64 indexed serviceId, address indexed operator, address indexed forcer);
+    // M-15 FIX: Event for tracking service fee distributor call failures
+    event ServiceFeeDistributorCallFailed(uint64 indexed serviceId, string operation, bytes reason);
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // SERVICE LIFECYCLE
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Terminate a service
+    function terminateService(uint64 serviceId) external nonReentrant {
+        Types.Service storage svc = _getService(serviceId);
+        if (svc.owner != msg.sender) {
+            revert Errors.NotServiceOwner(serviceId, msg.sender);
+        }
+
+        _terminateService(serviceId);
+    }
+
+    /// @notice Permissionlessly terminate an unpaid subscription after grace period
+    /// @dev Eligibility: service is active subscription, escrow cannot cover one period,
+    ///      and manager-resolved grace windows have elapsed past the billing due time.
+    function terminateServiceForNonPayment(uint64 serviceId) external nonReentrant {
+        Types.Service storage svc = _getService(serviceId);
+        if (svc.status != Types.ServiceStatus.Active) {
+            revert Errors.ServiceNotActive(serviceId);
+        }
+        if (svc.pricing != Types.PricingModel.Subscription) {
+            revert Errors.InvalidState();
+        }
+
+        Types.BlueprintConfig storage bpConfig = _blueprintConfigs[svc.blueprintId];
+        uint64 interval = bpConfig.subscriptionInterval;
+        uint256 rate = bpConfig.subscriptionRate;
+        uint256 balance = _serviceEscrows[serviceId].balance;
+        uint64 graceIntervals = _resolveNonPaymentGraceIntervals(svc.blueprintId, serviceId);
+
+        uint256 dueAt = uint256(svc.lastPaymentAt) + interval;
+        uint256 graceEndsAt = dueAt + (uint256(interval) * graceIntervals);
+        if (interval == 0 || balance >= rate || block.timestamp < graceEndsAt) {
+            revert Errors.NonPaymentTerminationNotEligible(serviceId, dueAt, graceEndsAt, rate, balance);
+        }
+
+        _terminateService(serviceId);
+        emit ServiceTerminatedForNonPayment(
+            serviceId, msg.sender, uint64(dueAt), uint64(graceEndsAt), rate, balance
+        );
+    }
+
+    function _resolveNonPaymentGraceIntervals(
+        uint64 blueprintId,
+        uint64 serviceId
+    )
+        internal
+        view
+        returns (uint64 graceIntervals)
+    {
+        graceIntervals = DEFAULT_NON_PAYMENT_GRACE_INTERVALS;
+        Types.Blueprint storage bp = _blueprints[blueprintId];
+        if (bp.manager == address(0)) return graceIntervals;
+
+        try IBlueprintServiceManager(bp.manager).getNonPaymentTerminationPolicy(serviceId) returns (
+            bool useDefault, uint64 customGraceIntervals
+        ) {
+            if (useDefault) return graceIntervals;
+            if (customGraceIntervals > MAX_NON_PAYMENT_GRACE_INTERVALS) {
+                return MAX_NON_PAYMENT_GRACE_INTERVALS;
+            }
+            return customGraceIntervals;
+        } catch {
+            return graceIntervals;
+        }
+    }
+
+    function _terminateService(uint64 serviceId) internal {
+        Types.Service storage svc = _getService(serviceId);
+        if (svc.status != Types.ServiceStatus.Active) {
+            revert Errors.ServiceNotActive(serviceId);
+        }
+
+        svc.status = Types.ServiceStatus.Terminated;
+        svc.terminatedAt = uint64(block.timestamp);
+
+        // Decrement active service count and deregister from heartbeat registry
+        uint64 blueprintId = svc.blueprintId;
+        uint256 operatorSetLength = _serviceOperatorSet[serviceId].length();
+        for (uint256 i = 0; i < operatorSetLength; i++) {
+            address operator = _serviceOperatorSet[serviceId].at(i);
+            if (_operatorActiveServiceCount[blueprintId][operator] > 0) {
+                _operatorActiveServiceCount[blueprintId][operator]--;
+            }
+            if (_operatorStatusRegistry != address(0)) {
+                try IOperatorStatusRegistry(_operatorStatusRegistry).deregisterOperator(serviceId, operator) { }
+                    catch { }
+            }
+        }
+
+        emit ServiceTerminated(serviceId);
+
+        // Refund remaining streamed payments to the service owner
+        // M-15 FIX: Emit event on external call failure
+        if (_serviceFeeDistributor != address(0)) {
+            try IServiceFeeDistributor(_serviceFeeDistributor).onServiceTerminated(serviceId, svc.owner) { }
+            catch (bytes memory reason) {
+                emit ServiceFeeDistributorCallFailed(serviceId, "onServiceTerminated", reason);
+            }
+        }
+
+        Types.Blueprint storage bp = _blueprints[svc.blueprintId];
+        if (bp.manager != address(0)) {
+            _tryCallManager(
+                bp.manager, abi.encodeCall(IBlueprintServiceManager.onServiceTermination, (serviceId, svc.owner))
+            );
+        }
+    }
+
+    /// @notice Add permitted caller
+    function addPermittedCaller(uint64 serviceId, address caller) external {
+        Types.Service storage svc = _getService(serviceId);
+        if (svc.owner != msg.sender) {
+            revert Errors.NotServiceOwner(serviceId, msg.sender);
+        }
+        _permittedCallers[serviceId].add(caller);
+    }
+
+    /// @notice Remove permitted caller
+    function removePermittedCaller(uint64 serviceId, address caller) external {
+        Types.Service storage svc = _getService(serviceId);
+        if (svc.owner != msg.sender) {
+            revert Errors.NotServiceOwner(serviceId, msg.sender);
+        }
+        _permittedCallers[serviceId].remove(caller);
+    }
+
+    /// @notice Join a dynamic service
+    function joinService(uint64 serviceId, uint16 exposureBps) external whenNotPaused nonReentrant {
+        (Types.Service storage svc, Types.Blueprint storage bp) = _loadJoinContext(serviceId);
+        if (_serviceSecurityRequirements[serviceId].length > 0) {
+            // Enforce explicit per-asset security commitments when the service requires them.
+            revert Errors.SecurityCommitmentsRequired(serviceId);
+        }
+        _validateJoinRequirements(serviceId, bp);
+        _finalizeJoin(serviceId, exposureBps, svc, bp);
+    }
+
+    /// @notice Join a dynamic service with per-asset security commitments
+    function joinServiceWithCommitments(
+        uint64 serviceId,
+        uint16 exposureBps,
+        Types.AssetSecurityCommitment[] calldata commitments
+    )
+        external
+        whenNotPaused
+        nonReentrant
+    {
+        (Types.Service storage svc, Types.Blueprint storage bp) = _loadJoinContext(serviceId);
+
+        Types.AssetSecurityRequirement[] storage requirements = _serviceSecurityRequirements[serviceId];
+        if (requirements.length > 0) {
+            _validateSecurityCommitments(requirements, commitments);
+        }
+
+        for (uint256 i = 0; i < commitments.length; i++) {
+            _serviceSecurityCommitments[serviceId][msg.sender].push(commitments[i]);
+            // forge-lint: disable-next-line(asm-keccak256)
+            bytes32 assetHash = keccak256(abi.encode(commitments[i].asset.kind, commitments[i].asset.token));
+            _serviceSecurityCommitmentBps[serviceId][msg.sender][assetHash] = commitments[i].exposureBps;
+            emit OperatorSecurityCommitment(
+                serviceId,
+                msg.sender,
+                uint8(commitments[i].asset.kind),
+                commitments[i].asset.token,
+                commitments[i].exposureBps
+            );
+        }
+        emit OperatorSecurityCommitmentsStored(serviceId, msg.sender, commitments.length);
+
+        _validateJoinRequirements(serviceId, bp);
+        _finalizeJoin(serviceId, exposureBps, svc, bp);
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EXIT QUEUE
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Schedule exit from a dynamic service
+    /// @dev Operator must wait for exit queue duration before executing
+    function scheduleExit(uint64 serviceId) external nonReentrant {
+        Types.Service storage svc = _getService(serviceId);
+        if (svc.status != Types.ServiceStatus.Active) {
+            revert Errors.ServiceNotActive(serviceId);
+        }
+        if (svc.membership != Types.MembershipModel.Dynamic) {
+            revert Errors.InvalidState();
+        }
+
+        Types.ServiceOperator storage opData = _serviceOperators[serviceId][msg.sender];
+        if (!opData.active) {
+            revert Errors.OperatorNotInService(serviceId, msg.sender);
+        }
+
+        // Check if already scheduled
+        Types.ExitRequest storage exitReq = _exitRequests[serviceId][msg.sender];
+        if (exitReq.pending) {
+            revert Errors.ExitAlreadyScheduled(serviceId, msg.sender);
+        }
+
+        // Get exit config
+        Types.ExitConfig memory exitConfig = _getExitConfig(svc.blueprintId, serviceId);
+
+        // Check minimum commitment duration
+        uint64 minCommitmentEnd = opData.joinedAt + exitConfig.minCommitmentDuration;
+        if (block.timestamp < minCommitmentEnd) {
+            revert Errors.ExitTooEarly(serviceId, msg.sender, minCommitmentEnd, uint64(block.timestamp));
+        }
+
+        // Calculate when exit can be executed
+        uint64 executeAfter = uint64(block.timestamp) + exitConfig.exitQueueDuration;
+
+        // Store exit request
+        _exitRequests[serviceId][msg.sender] = Types.ExitRequest({
+            serviceId: serviceId, scheduledAt: uint64(block.timestamp), executeAfter: executeAfter, pending: true
+        });
+
+        emit ExitScheduled(serviceId, msg.sender, executeAfter);
+
+        // Notify manager
+        Types.Blueprint storage bp = _blueprints[svc.blueprintId];
+        if (bp.manager != address(0)) {
+            _tryCallManager(
+                bp.manager,
+                abi.encodeCall(IBlueprintServiceManager.onExitScheduled, (serviceId, msg.sender, executeAfter))
+            );
+        }
+    }
+
+    /// @notice Execute a scheduled exit
+    /// @dev Can only be called after exit queue duration has passed
+    function executeExit(uint64 serviceId) external nonReentrant {
+        Types.ExitRequest storage exitReq = _exitRequests[serviceId][msg.sender];
+        if (!exitReq.pending) {
+            revert Errors.ExitNotScheduled(serviceId, msg.sender);
+        }
+
+        if (block.timestamp < exitReq.executeAfter) {
+            revert Errors.ExitNotExecutable(serviceId, msg.sender, exitReq.executeAfter, uint64(block.timestamp));
+        }
+
+        _executeLeave(serviceId, msg.sender);
+
+        // Clear exit request
+        delete _exitRequests[serviceId][msg.sender];
+    }
+
+    /// @notice Cancel a scheduled exit
+    function cancelExit(uint64 serviceId) external nonReentrant {
+        Types.ExitRequest storage exitReq = _exitRequests[serviceId][msg.sender];
+        if (!exitReq.pending) {
+            revert Errors.ExitNotScheduled(serviceId, msg.sender);
+        }
+
+        // Clear exit request
+        delete _exitRequests[serviceId][msg.sender];
+
+        emit ExitCanceled(serviceId, msg.sender);
+
+        // Notify manager
+        Types.Service storage svc = _getService(serviceId);
+        Types.Blueprint storage bp = _blueprints[svc.blueprintId];
+        if (bp.manager != address(0)) {
+            _tryCallManager(
+                bp.manager, abi.encodeCall(IBlueprintServiceManager.onExitCanceled, (serviceId, msg.sender))
+            );
+        }
+    }
+
+    /// @notice Force an operator to exit (service owner only, if allowed)
+    /// @dev Requires forceExitAllowed in exit config
+    function forceExit(uint64 serviceId, address operator) external nonReentrant {
+        Types.Service storage svc = _getService(serviceId);
+        if (svc.status != Types.ServiceStatus.Active) {
+            revert Errors.ServiceNotActive(serviceId);
+        }
+        if (svc.owner != msg.sender) {
+            revert Errors.NotServiceOwner(serviceId, msg.sender);
+        }
+
+        Types.ExitConfig memory exitConfig = _getExitConfig(svc.blueprintId, serviceId);
+        if (!exitConfig.forceExitAllowed) {
+            revert Errors.ForceExitNotAllowed(serviceId);
+        }
+
+        Types.ServiceOperator storage opData = _serviceOperators[serviceId][operator];
+        if (!opData.active) {
+            revert Errors.OperatorNotInService(serviceId, operator);
+        }
+
+        _executeLeave(serviceId, operator);
+
+        // Clear any pending exit request
+        delete _exitRequests[serviceId][operator];
+
+        emit ExitForced(serviceId, operator, msg.sender);
+    }
+
+    /// @notice Convenience leave function - schedules and immediately executes if allowed
+    /// @dev For backwards compatibility. Will fail if exit queue duration > 0
+    function leaveService(uint64 serviceId) external nonReentrant {
+        Types.Service storage svc = _getService(serviceId);
+        if (svc.status != Types.ServiceStatus.Active) {
+            revert Errors.ServiceNotActive(serviceId);
+        }
+        if (svc.membership != Types.MembershipModel.Dynamic) {
+            revert Errors.InvalidState();
+        }
+
+        Types.ServiceOperator storage opData = _serviceOperators[serviceId][msg.sender];
+        if (!opData.active) {
+            revert Errors.OperatorNotInService(serviceId, msg.sender);
+        }
+
+        Types.ExitConfig memory exitConfig = _getExitConfig(svc.blueprintId, serviceId);
+
+        // Check minimum commitment duration
+        uint64 minCommitmentEnd = opData.joinedAt + exitConfig.minCommitmentDuration;
+        if (block.timestamp < minCommitmentEnd) {
+            revert Errors.ExitTooEarly(serviceId, msg.sender, minCommitmentEnd, uint64(block.timestamp));
+        }
+
+        // If exit queue is required, must use scheduleExit/executeExit
+        if (exitConfig.exitQueueDuration > 0) {
+            revert Errors.ExitNotExecutable(
+                serviceId, msg.sender, uint64(block.timestamp) + exitConfig.exitQueueDuration, uint64(block.timestamp)
+            );
+        }
+
+        _executeLeave(serviceId, msg.sender);
+    }
+
+    /// @notice Internal function to execute operator leave
+    function _executeLeave(uint64 serviceId, address operator) internal {
+        Types.Service storage svc = _getService(serviceId);
+        // Cover the executeExit -> _executeLeave path so leaving a Terminated service
+        // can't double-decrement counts, double-emit OperatorLeftService, or fire
+        // onOperatorLeft for a dead service. The other entrypoints already gate on
+        // status before calling here; this is the catch-all.
+        if (svc.status != Types.ServiceStatus.Active) {
+            revert Errors.ServiceNotActive(serviceId);
+        }
+
+        if (svc.operatorCount <= svc.minOperators) {
+            revert Errors.InvalidState();
+        }
+
+        Types.ServiceOperator storage opData = _serviceOperators[serviceId][operator];
+        if (!opData.active) {
+            revert Errors.OperatorNotInService(serviceId, operator);
+        }
+
+        // Check if manager allows this operator to leave
+        Types.Blueprint storage bp = _blueprints[svc.blueprintId];
+        if (bp.manager != address(0)) {
+            try IBlueprintServiceManager(bp.manager).canLeave(serviceId, operator) returns (bool allowed) {
+                if (!allowed) {
+                    revert Errors.Unauthorized();
+                }
+            } catch { }
+        }
+
+        _removeOperatorFromService(serviceId, operator, svc, bp);
+    }
+
+    /// @notice Force remove operator from service - EMERGENCY USE ONLY
+    /// @dev WARNING: Bypasses exit queue and minimum operator checks.
+    /// Blueprint managers should use this sparingly as it can degrade service.
+    /// Only callable by the blueprint manager.
+    /// @param serviceId The service ID
+    /// @param operator The operator to remove
+    function forceRemoveOperator(uint64 serviceId, address operator) external nonReentrant {
+        Types.Service storage svc = _getService(serviceId);
+        if (svc.status != Types.ServiceStatus.Active) {
+            revert Errors.ServiceNotActive(serviceId);
+        }
+        Types.Blueprint storage bp = _blueprints[svc.blueprintId];
+
+        // Only blueprint manager can force remove
+        if (msg.sender != bp.manager) {
+            revert Errors.Unauthorized();
+        }
+
+        Types.ServiceOperator storage opData = _serviceOperators[serviceId][operator];
+        if (!opData.active) {
+            revert Errors.OperatorNotInService(serviceId, operator);
+        }
+
+        // A blueprint manager can previously have unconditionally evicted any
+        // honest operator from any service (no min-operator check, no exit
+        // queue). With sybil joiners on the same blueprint, that lets an
+        // attacker-controlled BSM bias the operator set toward their sybils
+        // and starve legitimate operators of payment share. The min-operator
+        // floor still applies on force-remove unless the BSM explicitly
+        // self-documents the bypass via `forceRemoveAllowsBelowMin`. The
+        // override path is still try/catch, so a missing implementation
+        // defaults to enforcing the floor.
+        if (svc.operatorCount <= svc.minOperators) {
+            bool allowBelowMin = false;
+            try IBlueprintServiceManager(bp.manager).forceRemoveAllowsBelowMin(serviceId) returns (bool ok) {
+                allowBelowMin = ok;
+            } catch { }
+            if (!allowBelowMin) {
+                revert Errors.InvalidState();
+            }
+        }
+
+        // Clear any pending exit request
+        delete _exitRequests[serviceId][operator];
+        _removeOperatorFromService(serviceId, operator, svc, bp);
+    }
+
+    /// @notice Get exit configuration for a service
+    /// @dev Checks manager hook first, falls back to protocol defaults
+    function _getExitConfig(
+        uint64 blueprintId,
+        uint64 serviceId
+    )
+        internal
+        view
+        returns (Types.ExitConfig memory config)
+    {
+        Types.Blueprint storage bp = _blueprints[blueprintId];
+
+        // Check if manager provides custom exit config
+        if (bp.manager != address(0)) {
+            try IBlueprintServiceManager(bp.manager).getExitConfig(serviceId) returns (
+                bool useDefault, uint64 minCommitmentDuration, uint64 exitQueueDuration, bool forceExitAllowed
+            ) {
+                if (!useDefault) {
+                    return Types.ExitConfig({
+                        minCommitmentDuration: minCommitmentDuration,
+                        exitQueueDuration: exitQueueDuration,
+                        forceExitAllowed: forceExitAllowed
+                    });
+                }
+            } catch { }
+        }
+
+        // Use protocol defaults
+        return Types.ExitConfig({
+            minCommitmentDuration: DEFAULT_MIN_COMMITMENT_DURATION,
+            exitQueueDuration: DEFAULT_EXIT_QUEUE_DURATION,
+            forceExitAllowed: false
+        });
+    }
+
+    // ═══════════════════════════════════════════════════════════════════════════
+    // EXIT QUEUE VIEW FUNCTIONS
+    // ═══════════════════════════════════════════════════════════════════════════
+
+    /// @notice Get exit request for an operator
+    function getExitRequest(uint64 serviceId, address operator) external view returns (Types.ExitRequest memory) {
+        return _exitRequests[serviceId][operator];
+    }
+
+    /// @notice Get exit status for an operator
+    function getExitStatus(uint64 serviceId, address operator) external view returns (Types.ExitStatus) {
+        Types.ExitRequest storage exitReq = _exitRequests[serviceId][operator];
+
+        if (!exitReq.pending) {
+            Types.ServiceOperator storage opData = _serviceOperators[serviceId][operator];
+            if (opData.leftAt > 0) {
+                return Types.ExitStatus.Completed;
+            }
+            return Types.ExitStatus.None;
+        }
+
+        if (block.timestamp >= exitReq.executeAfter) {
+            return Types.ExitStatus.Executable;
+        }
+
+        return Types.ExitStatus.Scheduled;
+    }
+
+    /// @notice Get exit config for a service
+    function getExitConfig(uint64 serviceId) external view returns (Types.ExitConfig memory) {
+        Types.Service storage svc = _services[serviceId];
+        return _getExitConfig(svc.blueprintId, serviceId);
+    }
+
+    /// @notice Check if operator can schedule exit now
+    function canScheduleExit(
+        uint64 serviceId,
+        address operator
+    )
+        external
+        view
+        returns (bool canExit, string memory reason)
+    {
+        Types.Service storage svc = _services[serviceId];
+        if (svc.membership != Types.MembershipModel.Dynamic) {
+            return (false, "Not dynamic membership");
+        }
+
+        Types.ServiceOperator storage opData = _serviceOperators[serviceId][operator];
+        if (!opData.active) {
+            return (false, "Not in service");
+        }
+
+        Types.ExitRequest storage exitReq = _exitRequests[serviceId][operator];
+        if (exitReq.pending) {
+            return (false, "Exit already scheduled");
+        }
+
+        Types.ExitConfig memory exitConfig = _getExitConfig(svc.blueprintId, serviceId);
+        uint64 minCommitmentEnd = opData.joinedAt + exitConfig.minCommitmentDuration;
+        if (block.timestamp < minCommitmentEnd) {
+            return (false, "Minimum commitment not met");
+        }
+
+        return (true, "");
+    }
+
+    /// @notice Validate security commitments
+    function _validateSecurityCommitments(
+        Types.AssetSecurityRequirement[] storage requirements,
+        Types.AssetSecurityCommitment[] calldata commitments
+    )
+        internal
+        view
+    {
+        for (uint256 i = 0; i < commitments.length; i++) {
+            for (uint256 j = i + 1; j < commitments.length; j++) {
+                if (
+                    commitments[i].asset.token == commitments[j].asset.token
+                        && commitments[i].asset.kind == commitments[j].asset.kind
+                ) {
+                    revert Errors.DuplicateAssetCommitment(uint8(commitments[i].asset.kind), commitments[i].asset.token);
+                }
+            }
+        }
+
+        for (uint256 i = 0; i < requirements.length; i++) {
+            Types.AssetSecurityRequirement storage req = requirements[i];
+            bool found = false;
+
+            for (uint256 j = 0; j < commitments.length; j++) {
+                if (commitments[j].asset.token == req.asset.token && commitments[j].asset.kind == req.asset.kind) {
+                    if (commitments[j].exposureBps < req.minExposureBps) {
+                        revert Errors.CommitmentBelowMinimum(
+                            req.asset.token, commitments[j].exposureBps, req.minExposureBps
+                        );
+                    }
+                    if (commitments[j].exposureBps > req.maxExposureBps) {
+                        revert Errors.CommitmentAboveMaximum(
+                            req.asset.token, commitments[j].exposureBps, req.maxExposureBps
+                        );
+                    }
+                    found = true;
+                    break;
+                }
+            }
+
+            if (!found) {
+                revert Errors.MissingAssetCommitment(req.asset.token);
+            }
+        }
+    }
+
+    function _loadJoinContext(
+        uint64 serviceId
+    )
+        private
+        view
+        returns (Types.Service storage svc, Types.Blueprint storage bp)
+    {
+        svc = _getService(serviceId);
+        if (svc.status != Types.ServiceStatus.Active) {
+            revert Errors.ServiceNotActive(serviceId);
+        }
+        if (svc.membership != Types.MembershipModel.Dynamic) {
+            revert Errors.InvalidState();
+        }
+        if (svc.maxOperators > 0 && svc.operatorCount >= svc.maxOperators) {
+            revert Errors.InvalidState();
+        }
+        if (_operatorRegistrations[svc.blueprintId][msg.sender].registeredAt == 0) {
+            revert Errors.OperatorNotRegistered(svc.blueprintId, msg.sender);
+        }
+        if (_serviceOperators[serviceId][msg.sender].active) {
+            revert Errors.InvalidState();
+        }
+        bp = _blueprints[svc.blueprintId];
+    }
+
+    function _validateJoinRequirements(uint64 serviceId, Types.Blueprint storage bp) private view {
+        uint256 minStake = _staking.minOperatorStake();
+        if (bp.manager != address(0)) {
+            try IBlueprintServiceManager(bp.manager).getMinOperatorStake() returns (
+                bool useDefault, uint256 customMin
+            ) {
+                if (!useDefault && customMin > 0) {
+                    minStake = customMin;
+                }
+            } catch { }
+
+            try IBlueprintServiceManager(bp.manager).canJoin(serviceId, msg.sender) returns (bool allowed) {
+                if (!allowed) {
+                    revert Errors.Unauthorized();
+                }
+            } catch { }
+        }
+
+        if (!_staking.meetsStakeRequirement(msg.sender, minStake)) {
+            revert Errors.InsufficientStake(msg.sender, minStake, _staking.getOperatorStake(msg.sender));
+        }
+    }
+
+    function _finalizeJoin(
+        uint64 serviceId,
+        uint16 exposureBps,
+        Types.Service storage svc,
+        Types.Blueprint storage bp
+    )
+        private
+    {
+        _serviceOperators[serviceId][msg.sender] = Types.ServiceOperator({
+            exposureBps: exposureBps, joinedAt: uint64(block.timestamp), leftAt: 0, active: true
+        });
+        _serviceOperatorSet[serviceId].add(msg.sender);
+        svc.operatorCount++;
+        _operatorActiveServiceCount[svc.blueprintId][msg.sender]++;
+
+        if (_operatorStatusRegistry != address(0)) {
+            try IOperatorStatusRegistry(_operatorStatusRegistry).registerOperator(serviceId, msg.sender) { } catch { }
+        }
+
+        emit OperatorJoinedService(serviceId, msg.sender, exposureBps);
+
+        if (bp.manager != address(0)) {
+            _tryCallManager(
+                bp.manager,
+                abi.encodeCall(IBlueprintServiceManager.onOperatorJoined, (serviceId, msg.sender, exposureBps))
+            );
+        }
+    }
+
+    function _removeOperatorFromService(
+        uint64 serviceId,
+        address operator,
+        Types.Service storage svc,
+        Types.Blueprint storage bp
+    )
+        private
+    {
+        _notifyDistributorOperatorLeaving(serviceId, operator);
+
+        Types.ServiceOperator storage opData = _serviceOperators[serviceId][operator];
+        opData.active = false;
+        opData.leftAt = uint64(block.timestamp);
+        _serviceOperatorSet[serviceId].remove(operator);
+        svc.operatorCount--;
+
+        if (_operatorActiveServiceCount[svc.blueprintId][operator] > 0) {
+            _operatorActiveServiceCount[svc.blueprintId][operator]--;
+        }
+
+        if (_operatorStatusRegistry != address(0)) {
+            try IOperatorStatusRegistry(_operatorStatusRegistry).deregisterOperator(serviceId, operator) { } catch { }
+        }
+
+        emit OperatorLeftService(serviceId, operator);
+
+        if (bp.manager != address(0)) {
+            _tryCallManager(bp.manager, abi.encodeCall(IBlueprintServiceManager.onOperatorLeft, (serviceId, operator)));
+        }
+    }
+
+    function _notifyDistributorOperatorLeaving(uint64 serviceId, address operator) private {
+        if (_serviceFeeDistributor != address(0)) {
+            try IServiceFeeDistributor(_serviceFeeDistributor).onOperatorLeaving(serviceId, operator) { }
+            catch (bytes memory reason) {
+                emit ServiceFeeDistributorCallFailed(serviceId, "onOperatorLeaving", reason);
+            }
+        }
+    }
+}
