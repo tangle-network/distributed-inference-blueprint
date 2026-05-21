@@ -14,7 +14,10 @@ contract DistributedInferenceBSMTest is Test {
     address public unregistered = address(0x9999);
 
     function setUp() public {
-        bsm = new DistributedInferenceBSM();
+        // Pre-bind tangleCore to the test contract so {BlueprintServiceManagerBase.onlyFromTangle}
+        // accepts direct calls from this test (which stands in for Tangle). Production
+        // deployments pass the real Tangle protocol address here.
+        bsm = new DistributedInferenceBSM(address(this));
 
         // Register 4 operators
         _registerOperator(operator1, 0, 25, "https://op1.example.com");

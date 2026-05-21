@@ -51,9 +51,10 @@ contract RegisterBlueprint is Script {
         vm.startBroadcast(deployerKey);
 
         // ── Deploy DistributedInferenceBSM ──────────────────────────────────
-        // No constructor args, no initializer; the BSM is a stateless
-        // coordinator that records pipeline membership + layer ranges.
-        DistributedInferenceBSM bsm = new DistributedInferenceBSM();
+        // The BSM pre-binds `tangleCore` in its constructor so the subsequent
+        // `Tangle.createBlueprint` → `onBlueprintCreated` hook is a no-op
+        // rebind to the same address (see {DistributedInferenceBSM.onBlueprintCreated}).
+        DistributedInferenceBSM bsm = new DistributedInferenceBSM(tangleAddr);
 
         // ── Register on Tangle ──────────────────────────────────────────────
         uint64 blueprintId = tangle.createBlueprint(_buildDefinition(address(bsm)));
