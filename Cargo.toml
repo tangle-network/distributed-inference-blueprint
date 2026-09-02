@@ -9,7 +9,7 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/tangle-network/distributed-inference-blueprint"
 
 [workspace.dependencies]
-blueprint-sdk = { git = "https://github.com/tangle-network/blueprint", rev = "be8bd303260d3b1e1df6624eeac92b3ce1f40c38", package = "blueprint-sdk", features = ["std", "tangle", "macros"] }
+blueprint-sdk = { git = "https://github.com/tangle-network/blueprint", rev = "a380ec1e6320a8e949a13410873154a4c1e2ff46", package = "blueprint-sdk", features = ["std", "tangle", "macros"] }
 alloy = { version = "1", features = ["full", "signer-local", "provider-http"] }
 alloy-sol-types = "1"
 tokio = { version = "1", features = ["full"] }
