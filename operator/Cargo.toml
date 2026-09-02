@@ -28,7 +28,7 @@ hex = { workspace = true }
 k256 = { workspace = true }
 
 # Shared inference operator infrastructure (billing, metrics, health, server helpers)
-tangle-inference-core = { git = "https://github.com/tangle-network/tangle-inference-core", branch = "master" }
+tangle-inference-core = { git = "https://github.com/tangle-network/tangle-inference-core", rev = "c7e11063a2ba30c662c64356a73bd81d4a03a267", default-features = false, features = ["billing", "http", "metrics"] }
 
 # Web framework (OpenAI-compatible HTTP server)
 axum = { version = "0.7", features = ["json", "macros"] }
