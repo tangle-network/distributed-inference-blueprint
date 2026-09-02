@@ -231,7 +231,8 @@ async fn test_chat_completions_billing_required() {
 
     assert_eq!(resp.status(), 402);
     let body: serde_json::Value = resp.json().await.unwrap();
-    assert!(body["error"]["message"]
+    assert_eq!(body["error"], "payment_required");
+    assert!(body["description"]
         .as_str()
         .unwrap()
         .contains("SpendAuth"));
