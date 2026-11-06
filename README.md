@@ -1,125 +1,15 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/tangle-network/tangle/main/assets/Tangle%20Banner.png" alt="Tangle Network Banner" width="100%">
-</p>
+# Distributed inference blueprint
 
-# Distributed Inference Blueprint
+Serve a model through vLLM's distributed engine and account for participating operators on Tangle. vLLM owns weights, tokenization, GPU execution and transport between Ray workers. The operator sends complete OpenAI requests to that engine's HTTP head and returns its output and metered usage.
 
-Pipeline-parallel inference for models too large for a single GPU. Split 400B+ parameter models across multiple Tangle operators, where each operator serves a contiguous range of transformer layers.
+Configure the engine with the core serving recipe and vLLM's supported distributed executor. Set `[pipeline].vllm_endpoint` to its HTTP head. Set `model_id`, `layer_start`, `layer_end`, and `total_layers` to this operator's allocation; GPU capability is a catalog class, count and VRAM per device. Core owns startup, registration payload transport, QoS, billing and the recipe catalog. GPU detection/catalog integration follows the SDK release; configured GPU facts must come from the actual allocation until then.
 
-## How It Works
+The head serves non-streaming `POST /v1/chat/completions`; other positions refuse customer inference. Responses preserve the engine's choices and usage. Missing usage is an upstream error. `/health` checks the engine and returns 503 when unavailable. `/v1/pipeline/status` reports its health and completed requests. The removed activation endpoints return 410: vLLM has no public `/process_layers` endpoint.
 
-```
-User Request
-    |
-    v
-Operator A (layers 0-31)    ──activations──>
-Operator B (layers 32-63)   ──activations──>
-Operator C (layers 64-95)   ──activations──>
-Operator D (layers 96-126)  ──response──>  User
-```
+The blueprint owner creates each on-chain pipeline with a model and a GPU requirement. `joinPipeline` checks the registered model, layer range, GPU class, VRAM per GPU, and the proportional GPU count. Operators sign their own joins and leaves. Tangle alone records revenue; unregistering an operator stops further accounting until valid coverage is restored. Join/leave chain jobs return an error directing callers to those signer-authorized BSM methods.
 
-Each operator:
-1. Registers on-chain with its GPU capabilities and assigned layer range
-2. Downloads only the model weights for its layers (not the full model)
-3. Runs a local vLLM instance serving its layer shard
-4. Receives intermediate activations from the upstream operator
-5. Processes through its layers and forwards to the downstream operator
-6. The tail operator produces the final output and returns it through the pipeline
+Set the chain, server, billing, GPU and pipeline sections through `DIST_INF_` environment variables or `OperatorConfig::load`. Run `cargo run --bin distributed-inference-operator`. Customer HTTP requests use core x402 SpendAuth when billing is enabled.
 
-Payment is split proportionally: an operator serving 25/100 layers gets 25% of the per-token price.
+Register through `deploy/register-blueprint.sh` with `RPC_URL`, `TANGLE_CORE` and the signer supplied through the vault. The shared core registration script reads `deploy/definition.json`; `contracts/script/Deploy.s.sol` only deploys the model-specific manager. Published binary references in that definition follow this repository's release workflow.
 
-## Components
-
-| Component | Path | Description |
-|---|---|---|
-| Operator binary | `operator/src/main.rs` | Startup, registration, BlueprintRunner |
-| Router + jobs | `operator/src/lib.rs` | INFERENCE_JOB, JOIN_PIPELINE_JOB, LEAVE_PIPELINE_JOB |
-| Pipeline manager | `operator/src/pipeline.rs` | Activation processing, forwarding, topology |
-| Model sharding | `operator/src/shard.rs` | Selective layer download from HuggingFace |
-| Peer networking | `operator/src/network.rs` | Point-to-point activation transfer between stages |
-| HTTP server | `operator/src/server.rs` | OpenAI-compatible API (head), activation endpoints |
-| Config | `operator/src/config.rs` | Pipeline, network, billing, GPU configuration |
-| QoS heartbeat | `operator/src/qos.rs` | layers_served, pipeline_latency_ms, peer connectivity |
-| Health | `operator/src/health.rs` | GPU detection via nvidia-smi |
-| BSM contract | `contracts/src/DistributedInferenceBSM.sol` | Pipeline groups, layer validation, payment splitting |
-
-## Supported Models
-
-| Model | Parameters | Layers | Min Operators | Min VRAM per Operator |
-|---|---|---|---|---|
-| Llama 3.1 405B | 405B | 126 | 4 | ~210 GiB (4x H100 80GB) |
-| Mixtral 8x22B | 176B | 56 | 2 | ~180 GiB (2x H100 80GB) |
-| Llama 3.1 70B | 70B | 80 | 2 | ~70 GiB (2x A100 80GB) |
-| DeepSeek-V2 | 236B | 60 | 4 | ~120 GiB |
-
-## TEE Support
-
-All pipeline stages run inside TEE enclaves (TeeLayer). Intermediate activations are signed by each operator, providing verifiable computation guarantees across the pipeline.
-
-## Quick Start
-
-### 1. Deploy the BSM contract
-
-```bash
-# Deploy DistributedInferenceBSM to Tangle
-forge create contracts/src/DistributedInferenceBSM.sol:DistributedInferenceBSM --rpc-url $TANGLE_RPC
-```
-
-### 2. Create a pipeline
-
-```bash
-# Create a pipeline for Llama 405B (126 layers, 4 operators)
-cast send $BSM_ADDRESS "createPipeline(string,uint32,uint256)" \
-  "meta-llama/Llama-3.1-405B-Instruct" 126 1000 --rpc-url $TANGLE_RPC
-```
-
-### 3. Configure and start operators
-
-Each operator needs a config specifying its layer range:
-
-```toml
-# Operator A config (head)
-[pipeline]
-model_id = "meta-llama/Llama-3.1-405B-Instruct"
-layer_start = 0
-layer_end = 32
-total_layers = 126
-vllm_endpoint = "http://127.0.0.1:8000"
-
-[network]
-listen_addr = "0.0.0.0"
-listen_port = 9090
-downstream_peer = "http://operator-b:8080"
-# upstream_peer not set (this is the head)
-```
-
-```bash
-# Build and run
-cargo build --release
-DIST_INF__PIPELINE__MODEL_ID="meta-llama/Llama-3.1-405B-Instruct" \
-DIST_INF__PIPELINE__LAYER_START=0 \
-DIST_INF__PIPELINE__LAYER_END=32 \
-./target/release/distributed-inference-operator
-```
-
-### 4. Send inference requests
-
-```bash
-# Requests go to the head operator (layer_start == 0)
-curl http://operator-a:8080/v1/chat/completions \
-  -H "Content-Type: application/json" \
-  -d '{
-    "model": "meta-llama/Llama-3.1-405B-Instruct",
-    "messages": [{"role": "user", "content": "Explain pipeline parallelism."}],
-    "max_tokens": 256
-  }'
-
-# Check pipeline status on any operator
-curl http://operator-b:8080/v1/pipeline/status
-```
-
-## Related Repos
-
-- [vllm-inference-blueprint](https://github.com/tangle-network/vllm-inference-blueprint) -- Single-operator vLLM inference
-- [blueprint-sdk](https://github.com/tangle-network/blueprint) -- Tangle Blueprint SDK
-- [tangle-router](https://github.com/tangle-network/tangle-router) -- AI model routing and pricing
+Run `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cd contracts && forge test` through `beelink-gate`. Integration tests use the actual HTTP adapter with only the engine process replaced at its HTTP boundary, plus deployed Solidity contracts with foreign-signer attempts.

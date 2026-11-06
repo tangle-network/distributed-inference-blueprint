@@ -6,11 +6,9 @@ use wiremock::{
 };
 
 use distributed_inference::config::{
-    BillingConfig, DistributedConfig, GpuConfig, NetworkConfig, OperatorConfig, ServerConfig,
-    TangleConfig,
+    BillingConfig, DistributedConfig, GpuConfig, OperatorConfig, ServerConfig, TangleConfig,
 };
-use distributed_inference::network::PipelineNetwork;
-use distributed_inference::pipeline::{self, PipelineManager};
+use distributed_inference::pipeline::PipelineManager;
 use distributed_inference::server::DistributedBackend;
 use distributed_inference::{AppStateBuilder, BillingClient, NonceStore};
 
@@ -39,17 +37,8 @@ fn test_config_single_operator(vllm_port: u16) -> OperatorConfig {
             layer_end: 32,
             total_layers: 32,
             vllm_endpoint: format!("http://127.0.0.1:{vllm_port}"),
-            max_model_len: 4096,
-            hf_token: None,
-            startup_timeout_secs: 5,
             price_per_input_token: 1,
             price_per_output_token: 1,
-        },
-        network: NetworkConfig {
-            upstream_peer: None,
-            downstream_peer: None,
-            activation_timeout_ms: 5000,
-            max_activation_bytes: 256 * 1024 * 1024,
         },
         server: ServerConfig {
             host: "127.0.0.1".into(),
@@ -96,8 +85,7 @@ async fn start_test_server(
     config.server.port = server_port;
     let config = Arc::new(config);
 
-    let network = Arc::new(PipelineNetwork::new(config.clone()));
-    let pipeline = Arc::new(PipelineManager::new(config.clone(), network.clone()));
+    let pipeline = Arc::new(PipelineManager::new(config.clone()));
     let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
 
     let billing = Arc::new(
@@ -106,7 +94,7 @@ async fn start_test_server(
     );
     let operator_address = billing.operator_address();
     let nonce_store = Arc::new(NonceStore::load(None));
-    let backend = DistributedBackend::new(config.clone(), pipeline, network);
+    let backend = DistributedBackend::new(config.clone(), pipeline);
     let state = AppStateBuilder::new()
         .billing(billing)
         .nonce_store(nonce_store)
@@ -129,8 +117,12 @@ async fn start_test_server(
 
 #[tokio::test]
 async fn test_health_check_single_operator() {
-    // Single operator = head + tail, no downstream needed
     let mock_vllm = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/health"))
+        .respond_with(ResponseTemplate::new(200))
+        .mount(&mock_vllm)
+        .await;
     let config = test_config_single_operator(mock_vllm.address().port());
 
     let (port, _tx, _h) = start_test_server(config).await;
@@ -168,50 +160,6 @@ async fn test_pipeline_status() {
 }
 
 #[tokio::test]
-async fn test_chat_completions_single_operator() {
-    let mock_vllm = MockServer::start().await;
-
-    // Mock the vLLM shard's /process_layers endpoint
-    Mock::given(method("POST"))
-        .and(path("/process_layers"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "request_id": "test-req",
-            "shape": [1, 5, 1],
-            "data": hex::encode(b"Hello world!"),
-            "metadata": {
-                "prompt": "test",
-                "max_tokens": 512,
-                "temperature": 0.7,
-                "stream": false
-            }
-        })))
-        .mount(&mock_vllm)
-        .await;
-
-    let config = test_config_single_operator(mock_vllm.address().port());
-    let (port, _tx, _h) = start_test_server(config).await;
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
-        .json(&serde_json::json!({
-            "messages": [{"role": "user", "content": "Hello"}],
-            "max_tokens": 512,
-            "temperature": 0.7,
-        }))
-        .send()
-        .await
-        .unwrap();
-
-    assert_eq!(resp.status(), 200);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["object"], "chat.completion");
-    assert!(body["id"].as_str().unwrap().starts_with("chatcmpl-"));
-    assert_eq!(body["choices"][0]["finish_reason"], "stop");
-    assert!(body["choices"][0]["message"]["content"].as_str().is_some());
-}
-
-#[tokio::test]
 async fn test_chat_completions_billing_required() {
     let mock_vllm = MockServer::start().await;
     let mut config = test_config_single_operator(mock_vllm.address().port());
@@ -232,59 +180,7 @@ async fn test_chat_completions_billing_required() {
     assert_eq!(resp.status(), 402);
     let body: serde_json::Value = resp.json().await.unwrap();
     assert_eq!(body["error"], "payment_required");
-    assert!(body["description"]
-        .as_str()
-        .unwrap()
-        .contains("SpendAuth"));
-}
-
-#[tokio::test]
-async fn test_receive_activations() {
-    let mock_vllm = MockServer::start().await;
-
-    // Mock the vLLM shard
-    Mock::given(method("POST"))
-        .and(path("/process_layers"))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "request_id": "act-req-1",
-            "shape": [1, 3, 1],
-            "data": hex::encode(b"processed"),
-            "metadata": {
-                "prompt": "test",
-                "max_tokens": 100,
-                "temperature": 0.5,
-                "stream": false
-            }
-        })))
-        .mount(&mock_vllm)
-        .await;
-
-    let config = test_config_single_operator(mock_vllm.address().port());
-    let (port, _tx, _h) = start_test_server(config).await;
-
-    let client = reqwest::Client::new();
-    let resp = client
-        .post(format!("http://127.0.0.1:{port}/v1/pipeline/activations"))
-        .json(&serde_json::json!({
-            "request_id": "act-req-1",
-            "shape": [1, 5, 1],
-            "data": hex::encode(b"input activations"),
-            "metadata": {
-                "prompt": "test",
-                "max_tokens": 100,
-                "temperature": 0.5,
-                "stream": false
-            }
-        }))
-        .send()
-        .await
-        .unwrap();
-
-    // Single operator is tail, so it returns the final output as JSON
-    assert_eq!(resp.status(), 200);
-    let body: serde_json::Value = resp.json().await.unwrap();
-    assert_eq!(body["request_id"], "act-req-1");
-    assert!(body["data"].as_str().is_some());
+    assert!(body["description"].as_str().unwrap().contains("SpendAuth"));
 }
 
 #[tokio::test]
@@ -296,12 +192,20 @@ async fn d9_real_engine_protocol_and_usage() {
             "model":"test-model", "choices":[{"index":0,"message":{"role":"assistant","content":"engine output"},"finish_reason":"stop"}],
             "usage":{"prompt_tokens":13,"completion_tokens":7,"total_tokens":20}
         }))).expect(1).mount(&engine).await;
-    let (port, _tx, _h) = start_test_server(test_config_single_operator(engine.address().port())).await;
-    let response = reqwest::Client::new().post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
-        .json(&serde_json::json!({"messages":[{"role":"user","content":"hello"}]})).send().await.unwrap();
-    assert_eq!(response.status(),200);
-    let response:serde_json::Value=response.json().await.unwrap();
-    assert_eq!(response["choices"][0]["message"]["content"],"engine output");
-    assert_eq!(response["usage"]["prompt_tokens"],13);
-    assert_eq!(response["usage"]["completion_tokens"],7);
+    let (port, _tx, _h) =
+        start_test_server(test_config_single_operator(engine.address().port())).await;
+    let response = reqwest::Client::new()
+        .post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .json(&serde_json::json!({"messages":[{"role":"user","content":"hello"}]}))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 200);
+    let response: serde_json::Value = response.json().await.unwrap();
+    assert_eq!(
+        response["choices"][0]["message"]["content"],
+        "engine output"
+    );
+    assert_eq!(response["usage"]["prompt_tokens"], 13);
+    assert_eq!(response["usage"]["completion_tokens"], 7);
 }

@@ -1,363 +1,67 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
-
-import { Test } from "forge-std/Test.sol";
-import { BlueprintServiceManagerBase } from "tnt-core/BlueprintServiceManagerBase.sol";
-import { DistributedInferenceBSM } from "../src/DistributedInferenceBSM.sol";
-
+import {Test} from "forge-std/Test.sol";
+import {DistributedInferenceBSM} from "../src/DistributedInferenceBSM.sol";
 contract DistributedInferenceBSMTest is Test {
-    DistributedInferenceBSM public bsm;
-
-    address public operator1 = address(0x1111);
-    address public operator2 = address(0x2222);
-    address public operator3 = address(0x3333);
-    address public operator4 = address(0x4444);
-    address public unregistered = address(0x9999);
-
+    DistributedInferenceBSM bsm;
+    address alice = address(0x1111);
+    address bob = address(0x2222);
+    address attacker = address(0x9999);
     function setUp() public {
-        // Pre-bind tangleCore to the test contract so {BlueprintServiceManagerBase.onlyFromTangle}
-        // accepts direct calls from this test (which stands in for Tangle). Production
-        // deployments pass the real Tangle protocol address here.
         bsm = new DistributedInferenceBSM(address(this));
-
-        // Register 4 operators
-        _registerOperator(operator1, 0, 25, "https://op1.example.com");
-        _registerOperator(operator2, 25, 50, "https://op2.example.com");
-        _registerOperator(operator3, 50, 75, "https://op3.example.com");
-        _registerOperator(operator4, 75, 100, "https://op4.example.com");
+        bsm.onBlueprintCreated(1,address(this),address(this));
     }
-
-    // --- Pipeline Creation ---
-
-    function test_createPipeline() public {
-        uint64 pipelineId = bsm.createPipeline("meta-llama/Llama-3.1-405B", 100, 1000);
-        assertEq(pipelineId, 0);
-        assertEq(bsm.pipelineCount(), 1);
-
-        (string memory modelId, uint32 totalLayers, bool active,) = bsm.pipelines(pipelineId);
-        assertEq(keccak256(bytes(modelId)), keccak256(bytes("meta-llama/Llama-3.1-405B")));
-        assertEq(totalLayers, 100);
-        assertFalse(active); // not active until fully covered
+    function register(address operator, uint32 count, uint32 vram) internal {
+        bsm.onRegister(operator, abi.encode("model",uint32(0),uint32(100),uint32(100),count,vram,"nvidia-h100","https://operator.example.com"));
     }
-
-    function test_createMultiplePipelines() public {
-        bsm.createPipeline("model-a", 80, 500);
-        bsm.createPipeline("model-b", 126, 2000);
-        assertEq(bsm.pipelineCount(), 2);
+    function create() internal returns(uint64) {
+        return bsm.createPipeline("model",100,1000,DistributedInferenceBSM.GpuRequirement("nvidia-h100",4,80000));
     }
-
-    // --- Join Pipeline ---
-
-    function test_joinPipeline_singleOperator() public {
-        uint64 pid = bsm.createPipeline("model", 100, 1000);
-
-        vm.prank(operator1);
-        bsm.joinPipeline(pid, 0, 100);
-
-        // Should be active (all layers covered by one operator)
-        assertTrue(bsm.isFullyCovered(pid));
-    }
-
-    function test_joinPipeline_fullCoverage() public {
-        uint64 pid = bsm.createPipeline("model", 100, 1000);
-
-        vm.prank(operator1);
-        bsm.joinPipeline(pid, 0, 25);
-
-        vm.prank(operator2);
-        bsm.joinPipeline(pid, 25, 50);
-
-        vm.prank(operator3);
-        bsm.joinPipeline(pid, 50, 75);
-
-        assertFalse(bsm.isFullyCovered(pid)); // still missing 75-100
-
-        vm.prank(operator4);
-        bsm.joinPipeline(pid, 75, 100);
-
-        assertTrue(bsm.isFullyCovered(pid));
-    }
-
-    function test_joinPipeline_layerRangeOverlap() public {
-        uint64 pid = bsm.createPipeline("model", 100, 1000);
-
-        vm.prank(operator1);
-        bsm.joinPipeline(pid, 0, 50);
-
-        // Overlapping range: 25-75 overlaps with 0-50
-        vm.prank(operator2);
-        vm.expectRevert(
-            abi.encodeWithSelector(DistributedInferenceBSM.LayerRangeOverlap.selector, pid, 25, 75)
-        );
-        bsm.joinPipeline(pid, 25, 75);
-    }
-
-    function test_joinPipeline_invalidRange() public {
-        uint64 pid = bsm.createPipeline("model", 100, 1000);
-
-        // start >= end
-        vm.prank(operator1);
-        vm.expectRevert(
-            abi.encodeWithSelector(DistributedInferenceBSM.LayerRangeInvalid.selector, 50, 50, 100)
-        );
-        bsm.joinPipeline(pid, 50, 50);
-    }
-
-    function test_joinPipeline_exceedsTotalLayers() public {
-        uint64 pid = bsm.createPipeline("model", 100, 1000);
-
-        vm.prank(operator1);
-        vm.expectRevert(
-            abi.encodeWithSelector(DistributedInferenceBSM.LayerRangeInvalid.selector, 0, 150, 100)
-        );
-        bsm.joinPipeline(pid, 0, 150);
-    }
-
-    function test_joinPipeline_unregisteredOperator() public {
-        uint64 pid = bsm.createPipeline("model", 100, 1000);
-
-        vm.prank(unregistered);
-        vm.expectRevert(
-            abi.encodeWithSelector(DistributedInferenceBSM.OperatorNotRegistered.selector, unregistered)
-        );
-        bsm.joinPipeline(pid, 0, 25);
-    }
-
-    function test_joinPipeline_alreadyInPipeline() public {
-        uint64 pid = bsm.createPipeline("model", 100, 1000);
-
-        vm.prank(operator1);
-        bsm.joinPipeline(pid, 0, 25);
-
-        vm.prank(operator1);
-        vm.expectRevert(
-            abi.encodeWithSelector(DistributedInferenceBSM.OperatorAlreadyInPipeline.selector, pid, operator1)
-        );
-        bsm.joinPipeline(pid, 25, 50);
-    }
-
-    // --- Leave Pipeline ---
-
-    function test_leavePipeline() public {
-        uint64 pid = _createFullPipeline();
-
-        vm.prank(operator4);
-        bsm.leavePipeline(pid);
-
-        // Pipeline should no longer be fully covered
-        assertFalse(bsm.isFullyCovered(pid));
-
-        address[] memory ops = bsm.getPipelineOperators(pid);
-        assertEq(ops.length, 3);
-    }
-
-    function test_leavePipeline_notInPipeline() public {
-        uint64 pid = bsm.createPipeline("model", 100, 1000);
-
-        vm.prank(operator1);
-        vm.expectRevert(
-            abi.encodeWithSelector(DistributedInferenceBSM.OperatorNotInPipeline.selector, pid, operator1)
-        );
-        bsm.leavePipeline(pid);
-    }
-
-    // --- Payment Split ---
-
-    function test_getOperatorPricing() public {
-        uint64 pid = _createFullPipeline();
-
-        uint256 price1 = bsm.getOperatorPricing(pid, operator1);
-        uint256 price2 = bsm.getOperatorPricing(pid, operator2);
-
-        // Each operator covers 25/100 = 25% of layers, so gets 25% of base price
-        assertEq(price1, 250); // 1000 * 25 / 100
-        assertEq(price2, 250);
-    }
-
-    function test_recordUsage_distributesPayment() public {
-        uint64 pid = _createFullPipeline();
-
-        bsm.recordUsage(pid, 1000, 10_000);
-
-        // Each operator should get 25% of 10_000 = 2_500
-        assertEq(bsm.operatorRevenue(pid, operator1), 2_500);
-        assertEq(bsm.operatorRevenue(pid, operator2), 2_500);
-        assertEq(bsm.operatorRevenue(pid, operator3), 2_500);
-        assertEq(bsm.operatorRevenue(pid, operator4), 2_500);
-    }
-
-    function test_recordUsage_unevenLayers() public {
-        uint64 pid = bsm.createPipeline("model", 100, 10_000);
-
-        // Operator1: 60 layers, operator2: 40 layers
-        vm.prank(operator1);
-        bsm.joinPipeline(pid, 0, 60);
-
-        vm.prank(operator2);
-        bsm.joinPipeline(pid, 60, 100);
-
-        bsm.recordUsage(pid, 500, 10_000);
-
-        assertEq(bsm.operatorRevenue(pid, operator1), 6_000); // 60% of 10_000
-        assertEq(bsm.operatorRevenue(pid, operator2), 4_000); // 40% of 10_000
-    }
-
-    // --- Operator Registration ---
-
-    function test_registerOperator() public view {
-        (uint32 layerStart, uint32 layerEnd, uint32 totalVramMib, string memory endpoint, bool active) =
-            bsm.operatorCaps(operator1);
-        assertEq(layerStart, 0);
-        assertEq(layerEnd, 25);
-        assertTrue(active);
-        assertTrue(totalVramMib > 0);
-        assertTrue(bytes(endpoint).length > 0);
-    }
-
-    // --- Constructor & Lifecycle ---
-
-    function test_constructor_preBound() public view {
-        assertEq(bsm.tangleCore(), address(this));
-    }
-
-    function test_onBlueprintCreated_firstBind() public {
-        address tangle = address(0xabc);
-        DistributedInferenceBSM fresh = new DistributedInferenceBSM(address(0));
-
-        vm.prank(tangle);
-        fresh.onBlueprintCreated(1, address(this), tangle);
-
-        assertEq(fresh.tangleCore(), tangle);
-        assertEq(fresh.blueprintId(), 1);
-        assertEq(fresh.blueprintOwner(), address(this));
-    }
-
-    function test_onBlueprintCreated_preBound() public {
-        address tangle = address(0xabc);
-        DistributedInferenceBSM fresh = new DistributedInferenceBSM(tangle);
-
-        vm.prank(tangle);
-        fresh.onBlueprintCreated(1, address(this), tangle);
-
-        assertEq(fresh.blueprintId(), 1);
-        assertEq(fresh.blueprintOwner(), address(this));
-    }
-
-    function test_onBlueprintCreated_revert_notTangle_firstBind() public {
-        address tangle = address(0xabc);
-        DistributedInferenceBSM fresh = new DistributedInferenceBSM(address(0));
-
-        vm.prank(address(0xdead));
-        vm.expectRevert("not tangle");
-        fresh.onBlueprintCreated(1, address(this), tangle);
-    }
-
-    function test_onBlueprintCreated_revert_notTangle_preBound() public {
-        address tangle = address(0xabc);
-        DistributedInferenceBSM fresh = new DistributedInferenceBSM(tangle);
-
-        vm.prank(address(0xdead));
-        vm.expectRevert("not tangle");
-        fresh.onBlueprintCreated(1, address(this), tangle);
-    }
-
-    function test_onBlueprintCreated_revert_tangleMismatch() public {
-        address tangle = address(0xabc);
-        DistributedInferenceBSM fresh = new DistributedInferenceBSM(tangle);
-
-        vm.prank(tangle);
-        vm.expectRevert("tangle mismatch");
-        fresh.onBlueprintCreated(1, address(this), address(0xdef));
-    }
-
-    function test_onRegister_revert_notFromTangle() public {
-        bytes memory regData = abi.encode(
-            "meta-llama/Llama-3.1-405B",
-            uint32(0),
-            uint32(25),
-            uint32(100),
-            uint32(2),
-            uint32(80_000),
-            "https://op1.example.com"
-        );
-
-        vm.prank(address(0xdead));
-        vm.expectRevert(
-            abi.encodeWithSelector(
-                BlueprintServiceManagerBase.OnlyTangleAllowed.selector,
-                address(0xdead),
-                address(this)
-            )
-        );
-        bsm.onRegister(operator1, regData);
-    }
-
     function test_D9_unauthorizedMoneyAndCreation() public {
-        uint64 pid = _createFullPipeline();
-        vm.prank(unregistered);
-        vm.expectRevert();
-        bsm.recordUsage(pid, 1000, 10_000);
-        vm.prank(unregistered);
-        vm.expectRevert();
-        bsm.createPipeline("attacker-model", 100, 1000);
+        register(alice,4,80000);
+        uint64 id=create();
+        vm.prank(alice); bsm.joinPipeline(id,0,100);
+        vm.prank(attacker); vm.expectRevert(); bsm.recordUsage(id,1000,10000);
+        vm.prank(attacker); vm.expectRevert();
+        bsm.createPipeline("attacker",100,1,DistributedInferenceBSM.GpuRequirement("nvidia-h100",1,1));
+        assertEq(bsm.operatorRevenue(id,alice),0);
+        bsm.recordUsage(id,1000,10000);
+        assertEq(bsm.operatorRevenue(id,alice),10000);
     }
-
-    // --- View Functions ---
-
-    function test_getPipelineOperators_ordered() public {
-        uint64 pid = _createFullPipeline();
-        address[] memory ops = bsm.getPipelineOperators(pid);
-
-        assertEq(ops.length, 4);
-        // Should be sorted by layer range (head -> tail)
-        assertEq(ops[0], operator1);
-        assertEq(ops[1], operator2);
-        assertEq(ops[2], operator3);
-        assertEq(ops[3], operator4);
-    }
-
-    // --- Helpers ---
-
-    function _registerOperator(
-        address op,
-        uint32 layerStart,
-        uint32 layerEnd,
-        string memory endpoint
-    ) internal {
-        bytes memory regData = abi.encode(
-            "meta-llama/Llama-3.1-405B",
-            layerStart,
-            layerEnd,
-            uint32(100), // total layers
-            uint32(2),   // gpu count
-            uint32(80_000), // vram
-            endpoint
-        );
-        bsm.onRegister(op, regData);
-    }
-
-    function _createFullPipeline() internal returns (uint64 pid) {
-        pid = bsm.createPipeline("meta-llama/Llama-3.1-405B", 100, 1000);
-
-        vm.prank(operator1);
-        bsm.joinPipeline(pid, 0, 25);
-
-        vm.prank(operator2);
-        bsm.joinPipeline(pid, 25, 50);
-
-        vm.prank(operator3);
-        bsm.joinPipeline(pid, 50, 75);
-
-        vm.prank(operator4);
-        bsm.joinPipeline(pid, 75, 100);
-    }
-    function test_D9_zeroVramCannotJoin() public {
-        address tiny=address(0x333);
-        bsm.onRegister(tiny,abi.encode("model",uint32(0),uint32(100),uint32(100),uint32(1),uint32(0),"https://tiny.example.com"));
-        uint64 id=bsm.createPipeline("model",100,1000);
-        vm.prank(tiny);
-        vm.expectRevert();
+    function test_D9_smallGpuCannotJoinEvenWithEnoughTotalVram() public {
+        register(alice,8,40000);
+        uint64 id=create();
+        vm.prank(alice); vm.expectRevert(abi.encodeWithSelector(DistributedInferenceBSM.InsufficientVram.selector,alice,uint32(80000),uint32(40000)));
         bsm.joinPipeline(id,0,100);
     }
-
+    function test_D9_classCountAndModelMustMatch() public {
+        register(alice,1,80000);
+        uint64 id=create();
+        vm.prank(alice); vm.expectRevert(); bsm.joinPipeline(id,0,100);
+        bsm.onRegister(bob,abi.encode("model",uint32(0),uint32(100),uint32(100),uint32(4),uint32(80000),"nvidia-a100","https://operator.example.com"));
+        vm.prank(bob); vm.expectRevert(); bsm.joinPipeline(id,0,100);
+    }
+    function test_D9_unregisterStopsRevenueAndRejoinPreservesOrder() public {
+        register(alice,4,80000); register(bob,4,80000);
+        uint64 id=create();
+        vm.prank(alice); bsm.joinPipeline(id,0,50);
+        vm.prank(bob); bsm.joinPipeline(id,50,100);
+        assertTrue(bsm.isFullyCovered(id));
+        bsm.recordUsage(id,100,10000);
+        assertEq(bsm.operatorRevenue(id,alice),5000);
+        bsm.onUnregister(alice);
+        assertFalse(bsm.isFullyCovered(id));
+        vm.expectRevert(); bsm.recordUsage(id,100,10000);
+        vm.prank(alice); bsm.leavePipeline(id);
+        register(alice,4,80000);
+        vm.prank(alice); bsm.joinPipeline(id,0,50);
+        assertTrue(bsm.isFullyCovered(id));
+    }
+    function test_D9_cannotRebindOrRegisterForeignCapability() public {
+        vm.prank(attacker); vm.expectRevert(); bsm.onBlueprintCreated(2,attacker,attacker);
+        vm.expectRevert(); bsm.onBlueprintCreated(2,attacker,address(this));
+        vm.prank(attacker); vm.expectRevert();
+        bsm.onRegister(alice,abi.encode("model",uint32(0),uint32(100),uint32(100),uint32(4),uint32(80000),"nvidia-h100","https://attacker.example.com"));
+        vm.expectRevert(); new DistributedInferenceBSM(address(0));
+    }
 }

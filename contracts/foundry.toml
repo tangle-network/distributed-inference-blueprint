@@ -6,7 +6,7 @@ solc = "0.8.26"
 evm_version = "cancun"
 via_ir = true
 optimizer_runs = 200
-fs_permissions = [{ access = "read-write", path = "./" }]
+fs_permissions = [{ access = "read-write", path = "./" }, { access = "read", path = "../deploy" }]
 fuzz = { runs = 1_000 }
 
 [fmt]

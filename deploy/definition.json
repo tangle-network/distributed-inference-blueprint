@@ -1,0 +1,58 @@
+{
+  "metadata_uri": "https://github.com/tangle-network/distributed-inference-blueprint",
+  "config": {
+    "membership": "Dynamic",
+    "min_operators": 2,
+    "max_operators": 0
+  },
+  "metadata": {
+    "name": "Distributed Inference Blueprint",
+    "description": "Pipeline-parallel inference for very large models split across multiple Tangle operators, with layer assignment, activation forwarding, and proportional payment splits.",
+    "author": "Tangle Network",
+    "code_repository": "https://github.com/tangle-network/distributed-inference-blueprint",
+    "website": "https://tangle.tools",
+    "license": "MIT OR Apache-2.0",
+    "profiling_data": "{\"execution_profile\":{\"gpu\":{\"policy\":\"required\",\"min_count\":1,\"min_vram_gb\":0}}}"
+  },
+  "jobs": [
+    {
+      "name": "inference"
+    },
+    {
+      "name": "join_pipeline"
+    },
+    {
+      "name": "leave_pipeline"
+    }
+  ],
+  "supported_memberships": [
+    "Dynamic"
+  ],
+  "sources": [
+    {
+      "kind": "Native",
+      "native": {
+        "fetcher": "Github",
+        "entrypoint": "distributed-inference-operator",
+        "github": {
+          "owner": "tangle-network",
+          "repo": "distributed-inference-blueprint",
+          "tag": "v0.1.0",
+          "binaries": [
+            {
+              "arch": "amd64",
+              "os": "linux",
+              "name": "distributed-inference-operator-x86_64-unknown-linux-gnu.tar.xz",
+              "sha256": "6bbeb362643231541b30bd6f1ed78e8b41e585629deb70f83b1ad03b7ea6c3c5"
+            }
+          ]
+        }
+      },
+      "testing": {
+        "cargo_package": "distributed-inference",
+        "cargo_bin": "distributed-inference-operator",
+        "base_path": "."
+      }
+    }
+  ]
+}
