@@ -14,8 +14,7 @@ pub struct PipelineStatus {
     pub total_layers: u32,
     pub is_head: bool,
     pub is_tail: bool,
-    pub upstream_connected: bool,
-    pub downstream_connected: bool,
+    pub engine_ready: bool,
     pub requests_processed: u64,
     pub pipeline_latency_ms: u64,
 }
@@ -96,8 +95,7 @@ impl PipelineManager {
             total_layers: self.config.pipeline.total_layers,
             is_head: self.config.is_pipeline_head(),
             is_tail: self.config.is_pipeline_tail(),
-            upstream_connected: ready,
-            downstream_connected: ready,
+            engine_ready: ready,
             requests_processed: self.requests_processed.load(Ordering::Relaxed),
             pipeline_latency_ms: self.latency_ms.load(Ordering::Relaxed),
         }

@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
 
-import { BlueprintServiceManagerBase } from "tnt-core/BlueprintServiceManagerBase.sol";
-contract DistributedInferenceBSM is BlueprintServiceManagerBase {
+import {InferenceBSMBase} from "tangle-inference-core/InferenceBSMBase.sol";
+contract DistributedInferenceBSM is InferenceBSMBase {
 
     struct PipelineGroup {
         string modelId;
@@ -57,24 +57,7 @@ contract DistributedInferenceBSM is BlueprintServiceManagerBase {
     error InsufficientVram(address operator, uint32 required, uint32 available);
     error GpuRequirementNotMet(address operator);
     error OperatorNotInPipeline(uint64 pipelineId, address operator);
-    constructor(address _tangleCore) {
-        require(_tangleCore != address(0), "tangle required");
-        tangleCore = _tangleCore;
-    }
-    function onBlueprintCreated(
-        uint64 _blueprintId,
-        address _owner,
-        address _tangleCore
-    )
-        external
-        override
-    {
-        require(msg.sender == tangleCore && _tangleCore == tangleCore, "not tangle");
-        if (blueprintOwner != address(0)) revert AlreadyInitialized();
-        require(_owner != address(0), "owner required");
-        blueprintId = _blueprintId;
-        blueprintOwner = _owner;
-    }
+    constructor(address registry) { _bindRegistrationCore(registry); }
     function onRegister(
         address operator,
         bytes calldata registrationInputs
