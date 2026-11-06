@@ -24,7 +24,7 @@ fn registration_payload(config: &OperatorConfig) -> Vec<u8> {
 tangle_inference_core::run_operator!(
     OperatorConfig::load(None),
     registration_payload,
-    distributed_inference::router(),
+    |_| distributed_inference::router(),
     |config| DistributedInferenceServer { config },
     qos
 );
