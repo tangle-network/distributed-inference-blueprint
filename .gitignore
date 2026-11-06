@@ -1,1 +1,19 @@
 target/
+node_modules/
+dist/
+out/
+cache/
+contracts/out/
+contracts/cache/
+contracts/dependencies/
+*.env
+*.env.*
+!.env.example
+.DS_Store
+.tangle/
+.foreman/
+
+# operator runtime nonce store
+data/
+
+contracts/broadcast/**/run-latest.json

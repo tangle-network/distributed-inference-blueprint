@@ -1,3 +1,5 @@
+version = 2
+
 [[dependencies]]
 name = "@openzeppelin-contracts"
 version = "5.1.0"
@@ -21,7 +23,7 @@ integrity = "3874463846ab995a6a9a88412913cacec6144f7605daa1af57c2d8bf3f210b13"
 
 [[dependencies]]
 name = "tnt-core"
-version = "0.13.0"
-url = "https://soldeer-revisions.s3.amazonaws.com/tnt-core/0_13_0_08-05-2026_21:58:28_tnt-core.zip"
-checksum = "b800ed4ca62ef85a7db2cbfcbfb0649459c5dfe714851581ef3069cccb595391"
-integrity = "0d1d5a9a10d694db8c3dd35e7ece816427606f9d0de77ebe01e7789a3d1fd558"
+version = "0.20.0"
+url = "https://soldeer-revisions.s3.amazonaws.com/tnt-core/0_20_0_06-11-2026_15:10:42_tnt-core.zip"
+checksum = "156bdded9587016c4698ddf53662278400f6292bfe7cfa52cae5874ab2b9447b"
+integrity = "e8e7da4abe5b861c902f7092706c7a6d15d6c9a977fad14705b2814a2f2d0359"

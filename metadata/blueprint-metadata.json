@@ -1,6 +1,6 @@
 {
   "name": "Distributed Inference Blueprint",
-  "description": "Pipeline-parallel inference for very large models split across multiple Tangle operators, with layer assignment, activation forwarding, and proportional payment splits.",
+  "description": "HTTP inference through a distributed vLLM engine with on-chain model layer allocation.",
   "author": "Tangle Network",
   "category": "AI Inference",
   "image": null,
@@ -10,7 +10,7 @@
   "integrity": null,
   "blueprintUi": {
     "displayName": "Distributed Inference",
-    "description": "Create and inspect multi-operator inference pipelines with layer ranges, peer connectivity, activation events, and pipeline-level health metrics.",
+    "description": "Inspect engine health and operator layer allocations.",
     "requestedSlug": "distributed-inference",
     "publisher": {
       "name": "Tangle Network",
@@ -36,35 +36,7 @@
       "secondaryColor": "#083344",
       "icon": "graph"
     },
-    "overviewCards": [
-      {
-        "id": "pipeline-scale",
-        "kind": "callout",
-        "title": "400B+ pipeline parallelism",
-        "description": "Split massive language models across multiple operators, each serving a contiguous layer range with activation forwarding and on-chain settlement of proportional payments.",
-        "tone": "success"
-      },
-      {
-        "id": "supported-models",
-        "kind": "checklist",
-        "title": "Supported architectures",
-        "items": [
-          "Llama 3.1 405B (126 layers)",
-          "Mixtral 8x22B (56 layers)",
-          "Llama 3.1 70B (80 layers)",
-          "DeepSeek-V2 (60 layers)"
-        ],
-        "tone": "info"
-      },
-      {
-        "id": "pipeline-health",
-        "kind": "stat",
-        "title": "Pipeline status",
-        "description": "Peer connectivity, layer coverage, and TEE activation signing.",
-        "value": "All stages online",
-        "tone": "neutral"
-      }
-    ],
+    "overviewCards": [],
     "actions": [
       {
         "id": "create-inference-pipeline",
@@ -99,7 +71,7 @@
       {
         "id": "join-pipeline-stage",
         "label": "Join as stage",
-        "description": "Register an operator to serve a contiguous layer range. Operator downloads weights for only its assigned layers, sets up peer networking, and begins receiving activations.",
+        "description": "Register a contiguous layer range for a model and GPU requirement.",
         "target": "resource",
         "submitLabel": "Join",
         "fields": [
@@ -168,36 +140,6 @@
         ]
       }
     ],
-    "modules": [
-      {
-        "module": "metrics-overview",
-        "slot": "overview",
-        "metricKeys": [
-          "layers_served",
-          "pipeline_latency_ms",
-          "upstream_connected"
-        ]
-      },
-      {
-        "module": "service-health",
-        "slot": "sidebar",
-        "eventKinds": [
-          "pipeline_created",
-          "stage_joined",
-          "downstream_connected",
-          "activation_forwarded"
-        ]
-      },
-      {
-        "module": "resource-events",
-        "slot": "resources",
-        "eventKinds": [
-          "pipeline_requests_processed",
-          "layer_assignment_complete",
-          "peer_handshake_success",
-          "payment_split_executed"
-        ]
-      }
-    ]
+    "modules": []
   }
 }

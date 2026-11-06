@@ -13,7 +13,7 @@ name = "distributed-inference-operator"
 path = "src/main.rs"
 
 [dependencies]
-blueprint-sdk = { workspace = true, features = ["tee", "networking"] }
+blueprint-sdk = { workspace = true, features = ["tee"] }
 alloy = { workspace = true }
 alloy-sol-types = { workspace = true }
 tokio = { workspace = true }
@@ -24,11 +24,9 @@ tracing-subscriber = { workspace = true }
 reqwest = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
-hex = { workspace = true }
-k256 = { workspace = true }
 
 # Shared inference operator infrastructure (billing, metrics, health, server helpers)
-tangle-inference-core = { git = "https://github.com/tangle-network/tangle-inference-core", rev = "c7e11063a2ba30c662c64356a73bd81d4a03a267", default-features = false, features = ["billing", "http", "metrics"] }
+tangle-inference-core = { git = "https://github.com/tangle-network/tangle-inference-core", rev = "55fa3b0d55bcf1544a0c6fc3f6487e0557dfc906", default-features = false, features = ["billing", "http", "metrics"] }
 
 # Web framework (OpenAI-compatible HTTP server)
 axum = { version = "0.7", features = ["json", "macros"] }
@@ -47,8 +45,6 @@ tokio-stream = { workspace = true }
 
 # Misc
 bytes = "1"
-uuid = { version = "1", features = ["v4"] }
-half = { version = "2", features = ["serde"] }
 
 [dev-dependencies]
 wiremock = "0.6"
