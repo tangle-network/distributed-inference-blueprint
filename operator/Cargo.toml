@@ -26,7 +26,7 @@ anyhow = { workspace = true }
 thiserror = { workspace = true }
 
 # Shared inference operator infrastructure (billing, metrics, health, server helpers)
-tangle-inference-core = { git = "https://github.com/tangle-network/tangle-inference-core", rev = "a0dddb2e66c12e94f5daf647eee1d8198d7b59c7", default-features = false, features = ["billing", "http", "metrics"] }
+tangle-inference-core = { git = "https://github.com/tangle-network/tangle-inference-core", rev = "d23953eb7e04484a6830f0caeee0e89394760ea5", default-features = false, features = ["billing", "http", "metrics"] }
 
 # Web framework (OpenAI-compatible HTTP server)
 axum = { version = "0.7", features = ["json", "macros"] }

@@ -10,6 +10,6 @@ The blueprint owner creates each on-chain pipeline with a model and a GPU requir
 
 Set the chain, server, billing, GPU and pipeline sections through `DIST_INF_` environment variables or `OperatorConfig::load`. Run `cargo run --bin distributed-inference-operator`. Customer HTTP requests use core x402 SpendAuth when billing is enabled.
 
-Register through `deploy/register-blueprint.sh` with `RPC_URL`, `TANGLE_CORE` and the signer supplied through the vault. The shared core registration script reads `deploy/definition.json`; `contracts/script/Deploy.s.sol` only deploys the model-specific manager. Published binary references in that definition follow this repository's release workflow.
+Register through `deploy/register-blueprint.sh` with `RPC_URL`, `TANGLE_CORE` and the signer supplied through the vault. The wrapper uses core to read the latest release's prepared definition; `contracts/script/Deploy.s.sol` only deploys the model-specific manager. `BLUEPRINT_DEFINITION` selects an explicit prepared definition; `BLUEPRINT_BINARY` permits a real local ELF only on loopback Anvil chain 31337. The maintained release workflow uses core's packager to publish the SDK manifest, archive names and actual binary digest before publishing the prepared definition.
 
 Run `cargo test`, `cargo clippy --all-targets -- -D warnings`, and `cd contracts && forge test` through `beelink-gate`. Integration tests use the actual HTTP adapter with only the engine process replaced at its HTTP boundary, plus deployed Solidity contracts with foreign-signer attempts.

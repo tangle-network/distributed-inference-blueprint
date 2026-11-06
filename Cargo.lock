@@ -8537,7 +8537,7 @@ checksum = "7b2093cf4c8eb1e67749a6762251bc9cd836b6fc171623bd0a9d324d37af2417"
 [[package]]
 name = "tangle-inference-core"
 version = "0.1.0"
-source = "git+https://github.com/tangle-network/tangle-inference-core?rev=a0dddb2e66c12e94f5daf647eee1d8198d7b59c7#a0dddb2e66c12e94f5daf647eee1d8198d7b59c7"
+source = "git+https://github.com/tangle-network/tangle-inference-core?rev=d23953eb7e04484a6830f0caeee0e89394760ea5#d23953eb7e04484a6830f0caeee0e89394760ea5"
 dependencies = [
  "alloy",
  "anyhow",
