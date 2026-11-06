@@ -15,18 +15,17 @@ contract DistributedInferenceBSMTest is Test {
         bsm.onRegister(operator, abi.encode("model",uint32(0),uint32(100),uint32(100),count,vram,"nvidia-h100","https://operator.example.com"));
     }
     function create() internal returns(uint64) {
-        return bsm.createPipeline("model",100,1000,DistributedInferenceBSM.GpuRequirement("nvidia-h100",4,80000));
+        return bsm.createPipeline("model",100,DistributedInferenceBSM.GpuRequirement("nvidia-h100",4,80000));
     }
     function test_D9_unauthorizedMoneyAndCreation() public {
         register(alice,4,80000);
         uint64 id=create();
         vm.prank(alice); bsm.joinPipeline(id,0,100);
-        vm.prank(attacker); vm.expectRevert(); bsm.recordUsage(id,1000,10000);
+        vm.prank(attacker);
+        (bool legacyUsage,) = address(bsm).call(abi.encodeWithSignature("recordUsage(uint64,uint256,uint256)",id,1000,10000));
+        assertFalse(legacyUsage, "removed unsigned revenue selector must revert");
         vm.prank(attacker); vm.expectRevert();
-        bsm.createPipeline("attacker",100,1,DistributedInferenceBSM.GpuRequirement("nvidia-h100",1,1));
-        assertEq(bsm.operatorRevenue(id,alice),0);
-        bsm.recordUsage(id,1000,10000);
-        assertEq(bsm.operatorRevenue(id,alice),10000);
+        bsm.createPipeline("attacker",100,DistributedInferenceBSM.GpuRequirement("nvidia-h100",1,1));
     }
     function test_D9_smallGpuCannotJoinEvenWithEnoughTotalVram() public {
         register(alice,8,40000);
@@ -41,17 +40,14 @@ contract DistributedInferenceBSMTest is Test {
         bsm.onRegister(bob,abi.encode("model",uint32(0),uint32(100),uint32(100),uint32(4),uint32(80000),"nvidia-a100","https://operator.example.com"));
         vm.prank(bob); vm.expectRevert(); bsm.joinPipeline(id,0,100);
     }
-    function test_D9_unregisterStopsRevenueAndRejoinPreservesOrder() public {
+    function test_D9_unregisterStopsCoverageAndRejoinPreservesOrder() public {
         register(alice,4,80000); register(bob,4,80000);
         uint64 id=create();
         vm.prank(alice); bsm.joinPipeline(id,0,50);
         vm.prank(bob); bsm.joinPipeline(id,50,100);
         assertTrue(bsm.isFullyCovered(id));
-        bsm.recordUsage(id,100,10000);
-        assertEq(bsm.operatorRevenue(id,alice),5000);
         bsm.onUnregister(alice);
         assertFalse(bsm.isFullyCovered(id));
-        vm.expectRevert(); bsm.recordUsage(id,100,10000);
         vm.prank(alice); bsm.leavePipeline(id);
         register(alice,4,80000);
         vm.prank(alice); bsm.joinPipeline(id,0,50);

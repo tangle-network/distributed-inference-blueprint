@@ -42,14 +42,11 @@ contract DistributedInferenceBSM is BlueprintServiceManagerBase {
     mapping(uint64 => LayerRange[]) internal pipelineRanges;
     mapping(address => OperatorCapabilities) public operatorCaps;
     mapping(address => uint256) private memberships;
-    mapping(uint64 => uint256) public basePricePerToken;
-    mapping(uint64 => mapping(address => uint256)) public operatorRevenue;
 
     event PipelineCreated(uint64 indexed pipelineId, string modelId, uint32 totalLayers);
     event OperatorJoined(uint64 indexed pipelineId, address indexed operator, uint32 layerStart, uint32 layerEnd);
     event OperatorLeft(uint64 indexed pipelineId, address indexed operator);
     event PipelineActivated(uint64 indexed pipelineId);
-    event PaymentDistributed(uint64 indexed pipelineId, address indexed operator, uint256 amount);
 
     error PipelineNotFound(uint64 pipelineId);
     error PipelineNotActive(uint64 pipelineId);
@@ -104,7 +101,6 @@ contract DistributedInferenceBSM is BlueprintServiceManagerBase {
     function createPipeline(
         string calldata modelId,
         uint32 totalLayers,
-        uint256 pricePerToken,
         GpuRequirement calldata gpu
     ) external onlyBlueprintOwner returns (uint64 pipelineId) {
         require(totalLayers > 0 && bytes(modelId).length > 0, "invalid model");
@@ -118,7 +114,6 @@ contract DistributedInferenceBSM is BlueprintServiceManagerBase {
         p.active = false;
         p.createdAt = block.timestamp;
 
-        basePricePerToken[pipelineId] = pricePerToken;
 
         emit PipelineCreated(pipelineId, modelId, totalLayers);
     }
@@ -190,37 +185,6 @@ contract DistributedInferenceBSM is BlueprintServiceManagerBase {
         p.active = false;
 
         emit OperatorLeft(pipelineId, msg.sender);
-    }
-    function getOperatorPricing(
-        uint64 pipelineId,
-        address operator
-    ) external view returns (uint256 pricePerToken) {
-        PipelineGroup storage p = pipelines[pipelineId];
-        if (bytes(p.modelId).length == 0) revert PipelineNotFound(pipelineId);
-
-        LayerRange storage range = layerRanges[pipelineId][operator];
-        if (range.end == 0) revert OperatorNotInPipeline(pipelineId, operator);
-
-        uint32 layersServed = range.end - range.start;
-        pricePerToken = (basePricePerToken[pipelineId] * layersServed) / p.totalLayers;
-    }
-    function recordUsage(
-        uint64 pipelineId,
-        uint256,
-        uint256 totalPayment
-    ) external onlyFromTangle {
-        PipelineGroup storage p = pipelines[pipelineId];
-        if (!p.active || !_allLayersCovered(pipelineId)) revert PipelineNotActive(pipelineId);
-        for (uint256 i = 0; i < p.operators.length; i++) {
-            address op = p.operators[i];
-            LayerRange storage range = layerRanges[pipelineId][op];
-            uint32 layersServed = range.end - range.start;
-
-            uint256 share = (totalPayment * layersServed) / p.totalLayers;
-            operatorRevenue[pipelineId][op] += share;
-
-            emit PaymentDistributed(pipelineId, op, share);
-        }
     }
     function getPipelineOperators(uint64 pipelineId) external view returns (address[] memory) {
         return pipelines[pipelineId].operators;

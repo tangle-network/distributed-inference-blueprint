@@ -1,6 +1,6 @@
 {
   "name": "Distributed Inference Blueprint",
-  "description": "HTTP inference through a distributed vLLM engine with on-chain layer allocation and proportional revenue accounting.",
+  "description": "HTTP inference through a distributed vLLM engine with on-chain model layer allocation.",
   "author": "Tangle Network",
   "category": "AI Inference",
   "image": null,
@@ -10,7 +10,7 @@
   "integrity": null,
   "blueprintUi": {
     "displayName": "Distributed Inference",
-    "description": "Inspect engine health, operator layer allocations, and on-chain revenue accounting.",
+    "description": "Inspect engine health and operator layer allocations.",
     "requestedSlug": "distributed-inference",
     "publisher": {
       "name": "Tangle Network",
