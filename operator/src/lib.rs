@@ -3,7 +3,6 @@ pub mod pipeline;
 pub use tangle_inference_core::qos;
 pub mod server;
 
-// Re-export shared infrastructure for downstream callers / tests.
 pub use tangle_inference_core::billing;
 pub use tangle_inference_core::metrics;
 pub use tangle_inference_core::server::{
@@ -181,9 +180,6 @@ pub async fn leave_pipeline(
 
 // --- Background service: HTTP server + pipeline coordinator ---
 
-/// Runs the HTTP server and manages the pipeline lifecycle. On the head
-/// operator this includes the billing-aware `AppState`; on intermediate and
-/// tail operators a lightweight `PeerState` is used instead.
 #[derive(Clone)]
 pub struct DistributedInferenceServer {
     pub config: Arc<OperatorConfig>,

@@ -43,6 +43,9 @@ impl PipelineManager {
             "streaming is not supported by this adapter"
         );
         request["model"] = json!(self.config.pipeline.model_id);
+        if request.get("max_tokens").is_none() {
+            request["max_tokens"] = json!(512);
+        }
         let start = std::time::Instant::now();
         let response = self
             .client
