@@ -292,6 +292,16 @@ contract DistributedInferenceBSMTest is Test {
         bsm.onRegister(operator1, regData);
     }
 
+    function test_D9_unauthorizedMoneyAndCreation() public {
+        uint64 pid = _createFullPipeline();
+        vm.prank(unregistered);
+        vm.expectRevert();
+        bsm.recordUsage(pid, 1000, 10_000);
+        vm.prank(unregistered);
+        vm.expectRevert();
+        bsm.createPipeline("attacker-model", 100, 1000);
+    }
+
     // --- View Functions ---
 
     function test_getPipelineOperators_ordered() public {

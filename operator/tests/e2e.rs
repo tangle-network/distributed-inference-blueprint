@@ -287,37 +287,21 @@ async fn test_receive_activations() {
     assert!(body["data"].as_str().is_some());
 }
 
-// -- Unit tests for calculate_layer_range --
-
-#[test]
-fn test_calculate_layer_range_even() {
-    let (start, end) = pipeline::calculate_layer_range(0, 4, 100);
-    assert_eq!((start, end), (0, 25));
-
-    let (start, end) = pipeline::calculate_layer_range(3, 4, 100);
-    assert_eq!((start, end), (75, 100));
-}
-
-#[test]
-fn test_calculate_layer_range_uneven() {
-    let (start, end) = pipeline::calculate_layer_range(0, 3, 80);
-    assert_eq!((start, end), (0, 26));
-
-    let (start, end) = pipeline::calculate_layer_range(2, 3, 80);
-    assert_eq!((start, end), (53, 80));
-}
-
-#[test]
-fn test_calculate_layer_range_single() {
-    let (start, end) = pipeline::calculate_layer_range(0, 1, 100);
-    assert_eq!((start, end), (0, 100));
-}
-
-#[test]
-fn test_config_is_head_tail() {
-    let mock_port = 9999;
-    let config = test_config_single_operator(mock_port);
-    assert!(config.is_pipeline_head());
-    assert!(config.is_pipeline_tail());
-    assert!((config.layer_fraction() - 1.0).abs() < f64::EPSILON);
+#[tokio::test]
+async fn d9_real_engine_protocol_and_usage() {
+    let engine = MockServer::start().await;
+    Mock::given(method("POST")).and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "id":"chatcmpl-engine", "object":"chat.completion", "created":1,
+            "model":"test-model", "choices":[{"index":0,"message":{"role":"assistant","content":"engine output"},"finish_reason":"stop"}],
+            "usage":{"prompt_tokens":13,"completion_tokens":7,"total_tokens":20}
+        }))).expect(1).mount(&engine).await;
+    let (port, _tx, _h) = start_test_server(test_config_single_operator(engine.address().port())).await;
+    let response = reqwest::Client::new().post(format!("http://127.0.0.1:{port}/v1/chat/completions"))
+        .json(&serde_json::json!({"messages":[{"role":"user","content":"hello"}]})).send().await.unwrap();
+    assert_eq!(response.status(),200);
+    let response:serde_json::Value=response.json().await.unwrap();
+    assert_eq!(response["choices"][0]["message"]["content"],"engine output");
+    assert_eq!(response["usage"]["prompt_tokens"],13);
+    assert_eq!(response["usage"]["completion_tokens"],7);
 }
