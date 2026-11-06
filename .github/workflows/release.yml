@@ -1,55 +1,59 @@
 name: Release
-
 on:
   push:
     tags: ['v*']
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Existing tag to (re)build a release for'
+        description: Existing tag to release
         required: true
-
 permissions:
   contents: write
-
-env:
-  CARGO_TERM_COLOR: always
-  BINARY_NAME: ${{ vars.BINARY_NAME || 'distributed-inference-operator' }}
-  TARGET: x86_64-unknown-linux-gnu
-  RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
-
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
+defaults:
+  run:
+    shell: bash
 jobs:
   release:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    env:
+      TAG: ${{ inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: ${{ github.event.inputs.tag && format('refs/tags/{0}', github.event.inputs.tag) || github.ref }}
-
+          ref: refs/tags/${{ inputs.tag || github.ref_name }}
+          persist-credentials: false
       - name: System dependencies
-        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev pkg-config
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo build
-        uses: Swatinem/rust-cache@v2
-
-      - name: Build release binary
-        run: cargo build --locked --release --target "$TARGET" --bin "$BINARY_NAME"
-
-      - name: Package SDK artifacts and registration definition
+        run: sudo apt-get update && sudo apt-get install -y protobuf-compiler libssl-dev pkg-config clang cmake
+      - uses: Swatinem/rust-cache@v2
+      - name: Install cargo-dist
         run: |
-          BIN="target/$TARGET/release/$BINARY_NAME"
-          strip "$BIN"
-          CORE_DIR="$(cargo metadata --locked --format-version 1 | jq -er '.packages[] | select(.name == "tangle-inference-core") | .manifest_path | sub("/Cargo.toml$"; "")')"
-          node "$CORE_DIR/scripts/register-blueprint.mjs" --package --definition deploy/definition.json --output-dir release --tag "$RELEASE_TAG" --binary "$BIN"
-
+          DIST_VERSION=$(python3 -c 'import tomllib; print(tomllib.load(open("dist-workspace.toml", "rb"))["dist"]["cargo-dist-version"])')
+          curl --proto '=https' --tlsv1.2 --fail --silent --show-error --location "https://github.com/astral-sh/cargo-dist/releases/download/v$DIST_VERSION/cargo-dist-installer.sh" | sh
+      - name: Build native release artifacts
+        run: |
+          cargo fetch --locked
+          CARGO_NET_OFFLINE=true dist build --tag "$TAG" --artifacts=all --output-format=json > "$RUNNER_TEMP/dist-manifest.json"
+          git diff --exit-code -- Cargo.lock
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 \
-            || gh release create "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" --title "$RELEASE_TAG" --notes "SDK operator bundle for $TARGET; checksums and registration definition are included."
-          gh release upload "$RELEASE_TAG" release/*.tar.xz release/*.sha256 release/dist-manifest.json --repo "$GITHUB_REPOSITORY" --clobber
-          gh release upload "$RELEASE_TAG" release/blueprint-definition.json --repo "$GITHUB_REPOSITORY" --clobber
+          gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1 ||
+            gh release create "$TAG" --repo "$GITHUB_REPOSITORY" --title "$TAG" --generate-notes --draft
+          UPLOAD_FILES=$(jq -er '.upload_files[]' "$RUNNER_TEMP/dist-manifest.json")
+          mapfile -t FILES <<< "$UPLOAD_FILES"
+          FILES+=("$RUNNER_TEMP/dist-manifest.json")
+          ASSETS=$(gh release view "$TAG" --repo "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+          for file in "${FILES[@]}"; do
+            name=$(basename "$file")
+            if grep -qxF "$name" <<< "$ASSETS"; then
+              gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern "$name" --dir "$RUNNER_TEMP/prior-release"
+              cmp "$RUNNER_TEMP/prior-release/$name" "$file"
+            fi
+          done
+          gh release upload "$TAG" "${FILES[@]}" --repo "$GITHUB_REPOSITORY" --clobber
+          gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false

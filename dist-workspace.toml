@@ -1,0 +1,9 @@
+[workspace]
+members = ["cargo:."]
+
+[dist]
+cargo-dist-version = "0.28.7-prerelease.1"
+ci = "github"
+pr-run-mode = "skip"
+targets = ["x86_64-unknown-linux-gnu"]
+allow-dirty = ["ci"]

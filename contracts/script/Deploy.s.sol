@@ -1,9 +1,16 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.26;
-import {RegisterBlueprint} from "tangle-inference-core/script/RegisterBlueprint.s.sol";
+import {Script, console2} from "forge-std/Script.sol";
 import {DistributedInferenceBSM} from "../src/DistributedInferenceBSM.sol";
-contract DeployInference is RegisterBlueprint {
-    function _deployManager() internal override returns(address) {
-        return address(new DistributedInferenceBSM(vm.envAddress("TANGLE_CORE")));
+
+/// Model-specific manager deployment; cargo-tangle registers the definition.
+contract Deploy is Script {
+    function run() external {
+        address registry = vm.envAddress("TANGLE_CORE");
+        require(registry.code.length != 0, "TANGLE_CORE has no code");
+        vm.startBroadcast();
+        DistributedInferenceBSM manager = new DistributedInferenceBSM(registry);
+        vm.stopBroadcast();
+        console2.log("DEPLOY_DISTRIBUTED_BSM=%s", vm.toString(address(manager)));
     }
 }

@@ -1,9 +1,10 @@
 {
   "metadata_uri": "https://github.com/tangle-network/distributed-inference-blueprint",
   "config": {
-    "membership": "Dynamic",
+    "membership": "dynamic",
     "min_operators": 2,
-    "max_operators": 0
+    "max_operators": 0,
+    "pricing": "event_driven"
   },
   "metadata": {
     "name": "Distributed Inference Blueprint",
@@ -12,7 +13,8 @@
     "code_repository": "https://github.com/tangle-network/distributed-inference-blueprint",
     "website": "https://tangle.tools",
     "license": "MIT OR Apache-2.0",
-    "profiling_data": "{\"execution_profile\":{\"gpu\":{\"policy\":\"required\",\"min_count\":1,\"min_vram_gb\":0}}}"
+    "profiling_data": "{\"execution_profile\":{\"gpu\":{\"policy\":\"required\",\"min_count\":1,\"min_vram_gb\":0}}}",
+    "category": "AI/Inference"
   },
   "jobs": [
     {
@@ -26,33 +28,41 @@
     }
   ],
   "supported_memberships": [
-    "Dynamic"
+    "dynamic"
   ],
   "sources": [
     {
-      "kind": "Native",
-      "native": {
-        "fetcher": "Github",
-        "entrypoint": "distributed-inference-operator",
-        "github": {
-          "owner": "tangle-network",
-          "repo": "distributed-inference-blueprint",
-          "tag": "v0.1.0",
-          "binaries": [
-            {
-              "arch": "amd64",
-              "os": "linux",
-              "name": "distributed-inference-operator-x86_64-unknown-linux-gnu.tar.xz",
-              "sha256": "6bbeb362643231541b30bd6f1ed78e8b41e585629deb70f83b1ad03b7ea6c3c5"
-            }
-          ]
-        }
-      },
+      "kind": "native",
       "testing": {
         "cargo_package": "distributed-inference",
         "cargo_bin": "distributed-inference-operator",
         "base_path": "."
-      }
+      },
+      "fetcher": "github",
+      "entrypoint": "./distributed-inference-operator",
+      "github": {
+        "owner": "tangle-network",
+        "repo": "distributed-inference-blueprint",
+        "tag": "v0.1.0",
+        "binaries": [
+          {
+            "arch": "amd64",
+            "os": "linux",
+            "name": "distributed-inference-operator-x86_64-unknown-linux-gnu.tar.xz",
+            "sha256": "6bbeb362643231541b30bd6f1ed78e8b41e585629deb70f83b1ad03b7ea6c3c5"
+          }
+        ]
+      },
+      "binaries": [
+        {
+          "arch": "amd64",
+          "os": "linux",
+          "name": "distributed-inference-operator-x86_64-unknown-linux-gnu.tar.xz",
+          "sha256": "6bbeb362643231541b30bd6f1ed78e8b41e585629deb70f83b1ad03b7ea6c3c5"
+        }
+      ]
     }
-  ]
+  ],
+  "manager": "0x0000000000000000000000000000000000000000",
+  "metadata_file": "definition.json"
 }
