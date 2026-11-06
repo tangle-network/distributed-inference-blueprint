@@ -8,7 +8,6 @@ contract DistributedInferenceBSM is InferenceBSMBase {
         string modelId;
         address[] operators;     // ordered by layer range (head -> tail)
         uint32 totalLayers;
-        bool active;
         uint256 createdAt;
     }
 
@@ -94,7 +93,6 @@ contract DistributedInferenceBSM is InferenceBSMBase {
         PipelineGroup storage p = pipelines[pipelineId];
         p.modelId = modelId;
         p.totalLayers = totalLayers;
-        p.active = false;
         p.createdAt = block.timestamp;
 
 
@@ -144,7 +142,6 @@ contract DistributedInferenceBSM is InferenceBSMBase {
 
         emit OperatorJoined(pipelineId, msg.sender, layerStart, layerEnd);
         if (_allLayersCovered(pipelineId)) {
-            p.active = true;
             emit PipelineActivated(pipelineId);
         }
     }
@@ -165,7 +162,6 @@ contract DistributedInferenceBSM is InferenceBSMBase {
         delete layerRanges[pipelineId][msg.sender];
         --memberships[msg.sender];
         _removeOperator(pipelineId, msg.sender);
-        p.active = false;
 
         emit OperatorLeft(pipelineId, msg.sender);
     }
