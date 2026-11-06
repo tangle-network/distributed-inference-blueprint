@@ -351,4 +351,13 @@ contract DistributedInferenceBSMTest is Test {
         vm.prank(operator4);
         bsm.joinPipeline(pid, 75, 100);
     }
+    function test_D9_zeroVramCannotJoin() public {
+        address tiny=address(0x333);
+        bsm.onRegister(tiny,abi.encode("model",uint32(0),uint32(100),uint32(100),uint32(1),uint32(0),"https://tiny.example.com"));
+        uint64 id=bsm.createPipeline("model",100,1000);
+        vm.prank(tiny);
+        vm.expectRevert();
+        bsm.joinPipeline(id,0,100);
+    }
+
 }
