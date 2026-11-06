@@ -124,16 +124,15 @@ pub fn router() -> Router {
 #[debug_job]
 pub async fn run_inference(
     TangleArg(request): TangleArg<InferenceRequest>,
-) -> Result<TangleResult<InferenceResult>, RunnerError> {
+) -> anyhow::Result<TangleResult<InferenceResult>> {
     let state = PIPELINE_STATE
         .get()
-        .ok_or_else(|| RunnerError::Other("pipeline state not registered".into()))?;
+        .ok_or_else(|| anyhow::anyhow!("pipeline state not registered"))?;
 
-    if !state.config.is_pipeline_head() {
-        return Err(RunnerError::Other(
-            "inference jobs must be submitted to the pipeline head operator".into(),
-        ));
-    }
+    anyhow::ensure!(
+        state.config.is_pipeline_head(),
+        "inference jobs must be submitted to the pipeline head operator"
+    );
 
     let response = state
         .pipeline
@@ -143,13 +142,11 @@ pub async fn run_inference(
             "max_tokens":request.maxTokens, "temperature":request.temperature as f64 / 1000.0,
             "stream":false,
         }))
-        .await
-        .map_err(|error| RunnerError::Other(error.to_string().into()))?;
-    let (prompt_tokens, completion_tokens) =
-        pipeline::usage(&response).map_err(|error| RunnerError::Other(error.to_string().into()))?;
+        .await?;
+    let (prompt_tokens, completion_tokens) = pipeline::usage(&response)?;
     let text = response["choices"][0]["message"]["content"]
         .as_str()
-        .ok_or_else(|| RunnerError::Other("engine returned no text".into()))?
+        .ok_or_else(|| anyhow::anyhow!("engine returned no text"))?
         .to_string();
     Ok(TangleResult(InferenceResult {
         text,
@@ -161,21 +158,17 @@ pub async fn run_inference(
 #[debug_job]
 pub async fn join_pipeline(
     TangleArg(request): TangleArg<JoinPipelineRequest>,
-) -> Result<TangleResult<JoinPipelineResult>, RunnerError> {
+) -> anyhow::Result<TangleResult<JoinPipelineResult>> {
     let _ = request;
-    Err(RunnerError::Other(
-        "join through DistributedInferenceBSM.joinPipeline with the operator signer".into(),
-    ))
+    anyhow::bail!("join through DistributedInferenceBSM.joinPipeline with the operator signer")
 }
 
 #[debug_job]
 pub async fn leave_pipeline(
     TangleArg(request): TangleArg<LeavePipelineRequest>,
-) -> Result<TangleResult<LeavePipelineResult>, RunnerError> {
+) -> anyhow::Result<TangleResult<LeavePipelineResult>> {
     let _ = request;
-    Err(RunnerError::Other(
-        "leave through DistributedInferenceBSM.leavePipeline with the operator signer".into(),
-    ))
+    anyhow::bail!("leave through DistributedInferenceBSM.leavePipeline with the operator signer")
 }
 
 // --- Background service: HTTP server + pipeline coordinator ---
