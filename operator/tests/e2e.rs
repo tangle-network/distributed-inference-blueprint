@@ -41,6 +41,7 @@ fn test_config_single_operator(vllm_port: u16) -> OperatorConfig {
             price_per_output_token: 1,
         },
         server: ServerConfig {
+            endpoint_key: None,
             host: "127.0.0.1".into(),
             port: 0,
             max_concurrent_requests: 32,
