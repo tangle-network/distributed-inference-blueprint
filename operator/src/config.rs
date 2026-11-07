@@ -20,7 +20,9 @@ pub struct DistributedConfig {
     pub layer_end: u32,
     pub total_layers: u32,
     pub vllm_endpoint: String,
+    #[serde(default)]
     pub price_per_input_token: u64,
+    #[serde(default)]
     pub price_per_output_token: u64,
 }
 impl OperatorConfig {
