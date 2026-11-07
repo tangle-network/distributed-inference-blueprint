@@ -140,7 +140,7 @@ async fn chat_completions(
     let prompt_tokens =
         (request["messages"].to_string().len() / 4 + 1).min(u32::MAX as usize) as u32;
     // A present but non-integer limit would skip the estimate while the engine still honours it.
-    let limit = |key: &str| request.get(key).map(|value| value.as_u64().ok_or(key));
+    let limit = |key: &str| request.get(key).map(|value| value.as_u64().ok_or(()));
     let (Ok(completion), Ok(legacy), Ok(n)) = (
         limit("max_completion_tokens").transpose(),
         limit("max_tokens").transpose(),
