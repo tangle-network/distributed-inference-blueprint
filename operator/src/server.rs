@@ -75,7 +75,7 @@ pub async fn start_head(
             state.clone(),
             authenticate_endpoint,
         ))
-        .with_state(state);
+        .with_state(state.clone());
     let listener = tokio::net::TcpListener::bind(bind).await?;
     Ok(tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, app)
@@ -86,6 +86,7 @@ pub async fn start_head(
         {
             tracing::error!(%error, "HTTP server stopped");
         }
+        state.drain_settlements().await;
     }))
 }
 
@@ -191,11 +192,10 @@ async fn chat_completions(
     let (prompt_tokens, completion_tokens) = usage(&response).expect("engine response validated");
     guard.set_tokens(prompt_tokens, completion_tokens);
     guard.set_success();
-    // Served work is settled even if the client disconnects or the request times out.
     if let Some(auth) = authorized {
         let cost = backend.calculate_cost(prompt_tokens, completion_tokens);
-        let state = state.clone();
-        tokio::spawn(async move { settle_request(&state, &auth, Some(cost)).await });
+        let settling = state.clone();
+        state.spawn_settlement(async move { settle_request(&settling, &auth, Some(cost)).await });
     }
     Json(response).into_response()
 }
