@@ -53,6 +53,30 @@ contract DistributedInferenceBSMTest is Test {
         vm.prank(alice); bsm.joinPipeline(id,0,50);
         assertTrue(bsm.isFullyCovered(id));
     }
+    function test_D9_unregisteredOperatorIsEvictedAndActiveOneIsNot() public {
+        register(alice,4,80000); register(bob,4,80000);
+        uint64 id=create();
+        vm.prank(alice); bsm.joinPipeline(id,0,50);
+        vm.prank(bob); bsm.joinPipeline(id,50,100);
+        vm.prank(attacker); vm.expectRevert(); bsm.evictInactive(id,bob);
+        bsm.onUnregister(alice);
+        vm.prank(attacker); bsm.evictInactive(id,alice);
+        assertEq(bsm.getPipelineOperators(id).length,1);
+        assertEq(bsm.allocatedGpus(alice),0);
+        register(address(0x3333),4,80000);
+        vm.prank(address(0x3333)); bsm.joinPipeline(id,0,50);
+        assertTrue(bsm.isFullyCovered(id));
+    }
+    function test_D9_gpusAreNotCountedTwiceAcrossPipelines() public {
+        register(alice,4,80000);
+        uint64 first=create(); uint64 second=create();
+        vm.prank(alice); bsm.joinPipeline(first,0,100);
+        vm.prank(alice); vm.expectRevert(abi.encodeWithSelector(DistributedInferenceBSM.GpuRequirementNotMet.selector,alice));
+        bsm.joinPipeline(second,0,100);
+        vm.prank(alice); bsm.leavePipeline(first);
+        vm.prank(alice); bsm.joinPipeline(second,0,100);
+        assertEq(bsm.allocatedGpus(alice),4);
+    }
     function test_D9_cannotRebindOrRegisterForeignCapability() public {
         vm.prank(attacker); vm.expectRevert(); bsm.onBlueprintCreated(2,attacker,attacker);
         vm.expectRevert(); bsm.onBlueprintCreated(2,attacker,address(this));

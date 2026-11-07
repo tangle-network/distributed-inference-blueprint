@@ -41,6 +41,9 @@ contract DistributedInferenceBSM is BlueprintServiceManagerBase {
     mapping(uint64 => LayerRange[]) internal pipelineRanges;
     mapping(address => OperatorCapabilities) public operatorCaps;
     mapping(address => uint256) private memberships;
+    /// GPUs each operator has committed across pipelines; a join may not reuse them.
+    mapping(address => uint256) public allocatedGpus;
+    mapping(uint64 => mapping(address => uint256)) internal reservedGpus;
 
     event PipelineCreated(uint64 indexed pipelineId, string modelId, uint32 totalLayers);
     event OperatorJoined(uint64 indexed pipelineId, address indexed operator, uint32 layerStart, uint32 layerEnd);
@@ -126,7 +129,7 @@ contract DistributedInferenceBSM is BlueprintServiceManagerBase {
         if (caps.modelHash != keccak256(bytes(p.modelId)) || caps.totalLayers != p.totalLayers
             || layerStart < caps.layerStart || layerEnd > caps.layerEnd
             || keccak256(bytes(caps.gpuClass)) != keccak256(bytes(gpu.gpuClass))
-            || caps.gpuCount < requiredCount) revert GpuRequirementNotMet(msg.sender);
+            || caps.gpuCount < allocatedGpus[msg.sender] + requiredCount) revert GpuRequirementNotMet(msg.sender);
         if (caps.vramPerGpuMib < gpu.vramPerGpuMib)
             revert InsufficientVram(msg.sender, gpu.vramPerGpuMib, caps.vramPerGpuMib);
 
@@ -137,6 +140,8 @@ contract DistributedInferenceBSM is BlueprintServiceManagerBase {
         });
         ranges.push(range);
         ++memberships[msg.sender];
+        allocatedGpus[msg.sender] += requiredCount;
+        reservedGpus[pipelineId][msg.sender] = requiredCount;
         layerRanges[pipelineId][msg.sender] = range;
         _insertOperatorSorted(pipelineId, msg.sender, layerStart);
 
@@ -146,24 +151,32 @@ contract DistributedInferenceBSM is BlueprintServiceManagerBase {
         }
     }
     function leavePipeline(uint64 pipelineId) external {
+        _leave(pipelineId, msg.sender);
+    }
+    /// Anyone may clear the layer range of an operator that has unregistered, so it cannot squat on it.
+    function evictInactive(uint64 pipelineId, address operator) external {
+        if (operatorCaps[operator].active) revert OperatorNotInPipeline(pipelineId, operator);
+        _leave(pipelineId, operator);
+    }
+    function _leave(uint64 pipelineId, address operator) internal {
         PipelineGroup storage p = pipelines[pipelineId];
         if (bytes(p.modelId).length == 0) revert PipelineNotFound(pipelineId);
-
-        LayerRange storage range = layerRanges[pipelineId][msg.sender];
-        if (range.end == 0) revert OperatorNotInPipeline(pipelineId, msg.sender);
+        LayerRange storage range = layerRanges[pipelineId][operator];
+        if (range.end == 0) revert OperatorNotInPipeline(pipelineId, operator);
         LayerRange[] storage ranges = pipelineRanges[pipelineId];
         for (uint256 i = 0; i < ranges.length; i++) {
-            if (ranges[i].operator == msg.sender) {
+            if (ranges[i].operator == operator) {
                 ranges[i] = ranges[ranges.length - 1];
                 ranges.pop();
                 break;
             }
         }
-        delete layerRanges[pipelineId][msg.sender];
-        --memberships[msg.sender];
-        _removeOperator(pipelineId, msg.sender);
-
-        emit OperatorLeft(pipelineId, msg.sender);
+        delete layerRanges[pipelineId][operator];
+        --memberships[operator];
+        allocatedGpus[operator] -= reservedGpus[pipelineId][operator];
+        delete reservedGpus[pipelineId][operator];
+        _removeOperator(pipelineId, operator);
+        emit OperatorLeft(pipelineId, operator);
     }
     function getPipelineOperators(uint64 pipelineId) external view returns (address[] memory) {
         return pipelines[pipelineId].operators;
