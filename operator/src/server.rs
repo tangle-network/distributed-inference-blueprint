@@ -135,11 +135,22 @@ async fn chat_completions(
     };
     // The engine receives this body as-is, so the estimate must bound everything it can generate.
     let prompt_tokens = (request["messages"].to_string().len() / 4 + 1).min(u32::MAX as usize) as u32;
-    let max_tokens = request["max_completion_tokens"]
-        .as_u64()
-        .or(request["max_tokens"].as_u64())
-        .unwrap_or(512);
-    let choices = request["n"].as_u64().unwrap_or(1).max(1);
+    // A present but non-integer limit would skip the estimate while the engine still honours it.
+    let limit = |key: &str| request.get(key).map(|value| value.as_u64().ok_or(key));
+    let (Ok(completion), Ok(legacy), Ok(n)) = (
+        limit("max_completion_tokens").transpose(),
+        limit("max_tokens").transpose(),
+        limit("n").transpose(),
+    ) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "max_completion_tokens, max_tokens and n must be non-negative integers".into(),
+            "invalid_request",
+            "invalid_limit",
+        );
+    };
+    let max_tokens = completion.or(legacy).unwrap_or(512);
+    let choices = n.unwrap_or(1).max(1);
     let completion_tokens = max_tokens.saturating_mul(choices).min(u32::MAX as u64) as u32;
     let estimated = backend.calculate_cost(prompt_tokens, completion_tokens);
     let healthy = backend.pipeline.healthy();
@@ -176,9 +187,11 @@ async fn chat_completions(
     let (prompt_tokens, completion_tokens) = usage(&response).expect("engine response validated");
     guard.set_tokens(prompt_tokens, completion_tokens);
     guard.set_success();
+    // Served work is settled even if the client disconnects or the request times out.
     if let Some(auth) = authorized {
         let cost = backend.calculate_cost(prompt_tokens, completion_tokens);
-        settle_request(&state, &auth, Some(cost)).await;
+        let state = state.clone();
+        tokio::spawn(async move { settle_request(&state, &auth, Some(cost)).await });
     }
     Json(response).into_response()
 }
