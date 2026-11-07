@@ -8,13 +8,12 @@ pub use tangle_inference_core::{AppStateBuilder, BillingClient, NonceStore};
 use blueprint_sdk::std::sync::Arc;
 
 use alloy_sol_types::sol;
-use blueprint_sdk::macros::debug_job;
-use blueprint_sdk::router::Router;
-use blueprint_sdk::runner::error::RunnerError;
-use blueprint_sdk::runner::BackgroundService;
+use blueprint_sdk::runner::{error::RunnerError, BackgroundService};
 use blueprint_sdk::tangle::extract::{TangleArg, TangleResult};
 use blueprint_sdk::tangle::layers::TangleLayer;
 use blueprint_sdk::Job;
+use blueprint_sdk::{macros::debug_job, router::Router};
+use tokio::signal::unix::{signal, SignalKind};
 use tokio::sync::oneshot;
 
 use crate::config::OperatorConfig;
@@ -168,24 +167,26 @@ impl BackgroundService for DistributedInferenceServer {
                 return;
             }
             let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);
-            let start_result =
-                build_head_state_and_start(config.clone(), pipeline, shutdown_rx).await;
-            match start_result {
-                Ok(handle) => {
-                    tokio::select! {
-                        result = handle => {
-                            let _ = tx.send(result.map_err(|error| RunnerError::Other(error.to_string().into())));
-                        }
-                        _ = tokio::signal::ctrl_c() => {
-                            let _ = shutdown_tx.send(true);
-                            let _ = tx.send(Ok(()));
-                        }
-                    }
-                }
+            let mut handle = match build_head_state_and_start(config, pipeline, shutdown_rx).await {
+                Ok(handle) => handle,
                 Err(error) => {
                     let _ = tx.send(Err(RunnerError::Other(error.to_string().into())));
+                    return;
                 }
+            };
+            let mut term = signal(SignalKind::terminate()).expect("SIGTERM handler");
+            tokio::select! {
+                result = &mut handle => {
+                    let _ = tx.send(result.map_err(|error| RunnerError::Other(error.to_string().into())));
+                    return;
+                }
+                _ = tokio::signal::ctrl_c() => {}
+                _ = term.recv() => {}
             }
+            // `run_operator!` gives the runner no stop hook: drain the server, then exit.
+            let _ = shutdown_tx.send(true);
+            let _ = handle.await;
+            std::process::exit(0);
         });
 
         Ok(rx)
@@ -199,17 +200,16 @@ async fn build_head_state_and_start(
     shutdown_rx: tokio::sync::watch::Receiver<bool>,
 ) -> anyhow::Result<tokio::task::JoinHandle<()>> {
     let billing_client = Arc::new(BillingClient::new(&config.tangle, &config.billing)?);
-    let operator_address = billing_client.operator_address();
     let nonce_store = Arc::new(NonceStore::load(config.billing.nonce_store_path.clone()));
     let backend = DistributedBackend::new(config.clone(), pipeline);
 
     let state = AppStateBuilder::new()
+        .operator_address(billing_client.operator_address())
         .billing(billing_client)
         .nonce_store(nonce_store)
         .server_config(Arc::new(config.server.clone()))
         .billing_config(Arc::new(config.billing.clone()))
         .tangle_config(Arc::new(config.tangle.clone()))
-        .operator_address(operator_address)
         .backend(backend)
         .build()?;
 
