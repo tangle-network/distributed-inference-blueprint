@@ -9,6 +9,8 @@ on:
         required: true
 permissions:
   contents: write
+  id-token: write
+  attestations: write
 concurrency:
   group: release-${{ inputs.tag || github.ref_name }}
   cancel-in-progress: false
@@ -38,6 +40,11 @@ jobs:
           cargo fetch --locked
           CARGO_NET_OFFLINE=true dist build --tag "$TAG" --artifacts=all --output-format=json > "$RUNNER_TEMP/dist-manifest.json"
           git diff --exit-code -- Cargo.lock
+      # The SDK fetcher runs `gh attestation verify` on each archive before trusting its binary.
+      - name: Attest native release archives
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: target/distrib/*.tar.xz
       - name: Publish GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
