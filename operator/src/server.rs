@@ -14,11 +14,10 @@ use serde_json::{json, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use tangle_inference_core::server::{
-    acquire_permit, billing_gate, error_response, metrics_handler, settle_billing,
+    acquire_permit, authenticate_endpoint, authorize_request, backend_unavailable, error_response,
+    metrics_handler, payment_required, resolve_payment_proof, settle_request,
 };
-use tangle_inference_core::{
-    AppState, CostModel, CostParams, PerTokenCostModel, RequestGuard, SpendAuthPayload,
-};
+use tangle_inference_core::{AppState, CostModel, CostParams, PerTokenCostModel, RequestGuard};
 use tokio::task::JoinHandle;
 use tower_http::{cors::CorsLayer, timeout::TimeoutLayer, trace::TraceLayer};
 
@@ -72,6 +71,10 @@ pub async fn start_head(
         )))
         .layer(CorsLayer::permissive())
         .layer(TraceLayer::new_for_http())
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            authenticate_endpoint,
+        ))
         .with_state(state);
     let listener = tokio::net::TcpListener::bind(bind).await?;
     Ok(tokio::spawn(async move {
@@ -114,33 +117,53 @@ async fn chat_completions(
         Ok(permit) => permit,
         Err(response) => return response,
     };
-    let spend_auth: Option<SpendAuthPayload> = match request
-        .as_object_mut()
-        .and_then(|body| body.remove("spend_auth"))
-    {
-        None | Some(Value::Null) => None,
-        Some(value) => match serde_json::from_value(value) {
-            Ok(auth) => Some(auth),
-            Err(_) => {
-                return error_response(
-                    StatusCode::BAD_REQUEST,
-                    "invalid SpendAuth".into(),
-                    "invalid_request",
-                    "invalid_spend_auth",
-                )
-            }
-        },
+    let take = |request: &mut Value, key: &str| {
+        let value = request.as_object_mut()?.remove(key)?;
+        (!value.is_null()).then_some(value)
     };
-    let estimated = backend.calculate_cost(
-        1000,
-        request["max_tokens"]
-            .as_u64()
-            .unwrap_or(512)
-            .min(u32::MAX as u64) as u32,
+    let (spend_auth, payment) = (
+        take(&mut request, "spend_auth"),
+        take(&mut request, "payment"),
     );
-    let (spend_auth, preauth) = match billing_gate(&state, &headers, spend_auth, estimated).await {
-        Ok(auth) => auth,
-        Err(response) => return response,
+    let (Ok(spend_auth), Ok(payment)) = (
+        spend_auth.map(serde_json::from_value).transpose(),
+        payment.map(serde_json::from_value).transpose(),
+    ) else {
+        return error_response(
+            StatusCode::BAD_REQUEST,
+            "invalid payment proof".into(),
+            "invalid_request",
+            "invalid_payment",
+        );
+    };
+    // The engine receives this body as-is, so the estimate must bound everything it can generate.
+    let prompt_tokens =
+        (request["messages"].to_string().len() / 4 + 1).min(u32::MAX as usize) as u32;
+    let max_tokens = request["max_completion_tokens"]
+        .as_u64()
+        .or(request["max_tokens"].as_u64())
+        .unwrap_or(512);
+    let choices = request["n"].as_u64().unwrap_or(1).max(1);
+    let completion_tokens = max_tokens.saturating_mul(choices).min(u32::MAX as u64) as u32;
+    let estimated = backend.calculate_cost(prompt_tokens, completion_tokens);
+    let healthy = backend.pipeline.healthy();
+    let authorized = match resolve_payment_proof(&headers, spend_auth, payment) {
+        Some(proof) => match authorize_request(&state, proof, estimated, healthy).await {
+            Ok(authorized) => Some(authorized),
+            Err(response) => return response,
+        },
+        None if state.billing_config.billing_required => {
+            return payment_required(
+                &state.billing_config,
+                &state.tangle_config,
+                state.operator_address,
+                estimated,
+            )
+        }
+        None => match healthy.await {
+            true => None,
+            false => return backend_unavailable(),
+        },
     };
     let mut guard = RequestGuard::new(&backend.config.pipeline.model_id);
     let response = match backend.pipeline.complete(request).await {
@@ -157,17 +180,9 @@ async fn chat_completions(
     let (prompt_tokens, completion_tokens) = usage(&response).expect("engine response validated");
     guard.set_tokens(prompt_tokens, completion_tokens);
     guard.set_success();
-    if let (Some(auth), Some(preauth)) = (spend_auth, preauth) {
-        if let Err(error) = settle_billing(
-            &state.billing,
-            &auth,
-            preauth,
-            Some(backend.calculate_cost(prompt_tokens, completion_tokens)),
-        )
-        .await
-        {
-            tracing::error!(%error, "settlement requires recovery");
-        }
+    if let Some(auth) = authorized {
+        let cost = backend.calculate_cost(prompt_tokens, completion_tokens);
+        settle_request(&state, &auth, Some(cost)).await;
     }
     Json(response).into_response()
 }
