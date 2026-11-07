@@ -4170,7 +4170,7 @@ dependencies = [
 
 [[package]]
 name = "distributed-inference"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "alloy 1.8.3",
  "alloy-primitives",

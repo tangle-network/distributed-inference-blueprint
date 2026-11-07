@@ -3,15 +3,7 @@ pub mod pipeline;
 pub use tangle_inference_core::qos;
 pub mod server;
 
-pub use tangle_inference_core::billing;
-pub use tangle_inference_core::metrics;
-pub use tangle_inference_core::server::{
-    error_response, extract_x402_spend_auth, payment_required, settle_billing, validate_spend_auth,
-};
-pub use tangle_inference_core::{
-    detect_gpus, parse_nvidia_smi_output, AppState, AppStateBuilder, BillingClient, CostModel,
-    CostParams, GpuInfo, NonceStore, PerTokenCostModel, RequestGuard, SpendAuthPayload,
-};
+pub use tangle_inference_core::{AppStateBuilder, BillingClient, NonceStore};
 
 use blueprint_sdk::std::sync::Arc;
 
@@ -70,8 +62,6 @@ sol! {
     }
 }
 
-// --- Job IDs ---
-
 pub const INFERENCE_JOB: u8 = 0;
 pub const JOIN_PIPELINE_JOB: u8 = 1;
 pub const LEAVE_PIPELINE_JOB: u8 = 2;
@@ -95,8 +85,6 @@ fn register_pipeline_state(
         .map_err(|_| RunnerError::Other("pipeline already registered".into()))
 }
 
-// --- Router ---
-
 pub fn router() -> Router {
     Router::new()
         .route(
@@ -118,8 +106,6 @@ pub fn router() -> Router {
                 .layer(blueprint_sdk::tee::TeeLayer::new()),
         )
 }
-
-// --- Job handlers ---
 
 #[debug_job]
 pub async fn run_inference(
@@ -157,17 +143,15 @@ pub async fn run_inference(
 
 #[debug_job]
 pub async fn join_pipeline(
-    TangleArg(request): TangleArg<JoinPipelineRequest>,
+    TangleArg(_): TangleArg<JoinPipelineRequest>,
 ) -> anyhow::Result<TangleResult<JoinPipelineResult>> {
-    let _ = request;
     anyhow::bail!("join through DistributedInferenceBSM.joinPipeline with the operator signer")
 }
 
 #[debug_job]
 pub async fn leave_pipeline(
-    TangleArg(request): TangleArg<LeavePipelineRequest>,
+    TangleArg(_): TangleArg<LeavePipelineRequest>,
 ) -> anyhow::Result<TangleResult<LeavePipelineResult>> {
-    let _ = request;
     anyhow::bail!("leave through DistributedInferenceBSM.leavePipeline with the operator signer")
 }
 
