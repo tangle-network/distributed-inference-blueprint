@@ -20,9 +20,7 @@ pub struct DistributedConfig {
     pub layer_end: u32,
     pub total_layers: u32,
     pub vllm_endpoint: String,
-    #[serde(default)]
     pub price_per_input_token: u64,
-    #[serde(default)]
     pub price_per_output_token: u64,
 }
 impl OperatorConfig {
@@ -56,6 +54,12 @@ impl OperatorConfig {
                     .is_some_and(|class| !class.is_empty()),
             "GPU class, count and VRAM per GPU are required"
         );
+        anyhow::ensure!(
+            !cfg.billing.billing_required
+                || (cfg.pipeline.price_per_input_token > 0
+                    && cfg.pipeline.price_per_output_token > 0),
+            "billing_required needs nonzero input and output token prices"
+        );
         Ok(cfg)
     }
     pub fn is_pipeline_head(&self) -> bool {
@@ -63,9 +67,5 @@ impl OperatorConfig {
     }
     pub fn is_pipeline_tail(&self) -> bool {
         self.pipeline.layer_end == self.pipeline.total_layers
-    }
-    pub fn layer_fraction(&self) -> f64 {
-        let layers_served = self.pipeline.layer_end - self.pipeline.layer_start;
-        layers_served as f64 / self.pipeline.total_layers as f64
     }
 }
