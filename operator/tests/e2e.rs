@@ -193,6 +193,8 @@ async fn d9_real_engine_protocol_and_usage() {
             "model":"test-model", "choices":[{"index":0,"message":{"role":"assistant","content":"engine output"},"finish_reason":"stop"}],
             "usage":{"prompt_tokens":13,"completion_tokens":7,"total_tokens":20}
         }))).expect(1).mount(&engine).await;
+    // Like vLLM, the engine answers /health; requests are refused while it does not.
+    Mock::given(method("GET")).and(path("/health")).respond_with(ResponseTemplate::new(200)).mount(&engine).await;
     let (port, _tx, _h) =
         start_test_server(test_config_single_operator(engine.address().port())).await;
     let response = reqwest::Client::new()
