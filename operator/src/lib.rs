@@ -21,8 +21,6 @@ use crate::config::OperatorConfig;
 use crate::pipeline::PipelineManager;
 use crate::server::DistributedBackend;
 
-// --- ABI types for on-chain job encoding ---
-
 sol! {
     #[derive(Debug, serde::Serialize, serde::Deserialize)]
     struct InferenceRequest {
@@ -65,8 +63,6 @@ sol! {
 pub const INFERENCE_JOB: u8 = 0;
 pub const JOIN_PIPELINE_JOB: u8 = 1;
 pub const LEAVE_PIPELINE_JOB: u8 = 2;
-
-// --- Shared state for the on-chain job handler ---
 
 static PIPELINE_STATE: std::sync::OnceLock<PipelineState> = std::sync::OnceLock::new();
 
@@ -154,8 +150,6 @@ pub async fn leave_pipeline(
 ) -> anyhow::Result<TangleResult<LeavePipelineResult>> {
     anyhow::bail!("leave through DistributedInferenceBSM.leavePipeline with the operator signer")
 }
-
-// --- Background service: HTTP server + pipeline coordinator ---
 
 #[derive(Clone)]
 pub struct DistributedInferenceServer {

@@ -121,7 +121,10 @@ async fn chat_completions(
         let value = request.as_object_mut()?.remove(key)?;
         (!value.is_null()).then_some(value)
     };
-    let (spend_auth, payment) = (take(&mut request, "spend_auth"), take(&mut request, "payment"));
+    let (spend_auth, payment) = (
+        take(&mut request, "spend_auth"),
+        take(&mut request, "payment"),
+    );
     let (Ok(spend_auth), Ok(payment)) = (
         spend_auth.map(serde_json::from_value).transpose(),
         payment.map(serde_json::from_value).transpose(),
@@ -134,7 +137,8 @@ async fn chat_completions(
         );
     };
     // The engine receives this body as-is, so the estimate must bound everything it can generate.
-    let prompt_tokens = (request["messages"].to_string().len() / 4 + 1).min(u32::MAX as usize) as u32;
+    let prompt_tokens =
+        (request["messages"].to_string().len() / 4 + 1).min(u32::MAX as usize) as u32;
     // A present but non-integer limit would skip the estimate while the engine still honours it.
     let limit = |key: &str| request.get(key).map(|value| value.as_u64().ok_or(key));
     let (Ok(completion), Ok(legacy), Ok(n)) = (
